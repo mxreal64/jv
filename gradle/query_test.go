@@ -21,7 +21,7 @@ func fakeGradle(t *testing.T, dir, body string) string {
 		t.Skip("the fake gradle is a POSIX shell script")
 	}
 	script := "#!/bin/sh\n" +
-		"pwd > \"$0.cwd\"\n" +
+		"pwd -P > \"$0.cwd\"\n" + // physical path: macOS temp dirs are symlinks (/var -> /private/var)
 		"printf '%s\\n' \"$@\" > \"$0.args\"\n" +
 		"out=\n" +
 		"for a in \"$@\"; do case \"$a\" in -Djv.model.out=*) out=\"${a#-Djv.model.out=}\" ;; esac; done\n" +
