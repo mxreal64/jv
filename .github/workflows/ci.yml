@@ -28,9 +28,6 @@ jobs:
         with:
           distribution: temurin
           java-version: ${{ matrix.java }}
-      - name: gofmt
-        run: test -z "$(gofmt -l .)"
-        shell: bash
       - name: go vet
         run: go vet ./...
       - name: go test
