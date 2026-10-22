@@ -3,7 +3,7 @@
 ## Getting started
 
 ```
-git clone https://github.com/jv-build/jv
+git clone https://github.com/mxreal64/jv
 cd jv
 make build          # builds ./jv
 make test           # go test -race ./...
