@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 jv contributors
 # test-all.sh - comprehensive tests for jv.
 #
 #   ./test-all.sh                 static checks + unit tests + end-to-end scenarios (+ Maven parity if mvn exists)
@@ -17,7 +19,7 @@
 # Environment: STRICT_ORDER=1 makes classpath *order* differences against Maven a failure
 #              (otherwise they are reported as warnings; the set of jars must always match).
 #
-# Needs: go (unless --jv), java + javac 17+, bash. Optional: mvn (enables parity checks), git (corpus),
+# Needs: go (unless --jv), java + javac 17+, bash. Optional: mvn (parity checks), gradle (real-Gradle run), git (corpus),
 # curl, python3.
 
 set -u
@@ -526,6 +528,165 @@ sc_fallback() {
   fi
 }
 
+# ---------------------------------------------------------------- Gradle
+# A Gradle project is built natively from a model a real Gradle reports once (see README). These
+# scenarios stand in for Gradle with a stub `gradle` that answers the model query from a canned
+# JSON file, so they need no Gradle at all: jv compiles, packages and cleans with javac.
+stub_queries() { local n; n=$(grep -c 'jvModel' "$JV_STUB_LOG" 2>/dev/null); echo "${n:-0}"; }
+
+gradle_proj() { # dir path name [classpath-json] [mainRes-json]   one Java project as the model reports it
+  local dir=$1 path=$2 name=$3 cp=${4:-[]} res=${5:-[]}
+  cat <<EOF
+{"path":"$path","dir":"$dir","name":"$name","group":"demo","version":"1.0","buildDir":"$dir/build",
+"plugins":["org.gradle.api.plugins.JavaPlugin"],"java":true,
+"mainJava":["$dir/src/main/java"],"mainRes":$res,"testJava":[],"testRes":[],
+"mainClasses":["$dir/build/classes/java/main"],"testClasses":["$dir/build/classes/java/test"],
+"mainResOut":"$dir/build/resources/main","testResOut":"$dir/build/resources/test",
+"compile":$cp,"runtime":$cp,"testCompile":$cp,"testRuntime":$cp,"processors":[],"compilerArgs":[],
+"encoding":"UTF-8","release":"","source":"","target":"","compileDeps":["compileJava"],
+"testEnabled":true,"testFramework":"","jvmArgs":[],"systemProps":{},
+"jar":"$dir/build/libs/$name-1.0.jar","manifest":{"Main-Class":"demo.App"}}
+EOF
+}
+
+sc_gradle() {
+  begin gradle
+  local d="$WORK/gradle-single" m="$WORK/gradle-multi" bindir="$WORK/gradle-stub-bin" oldpath=$PATH
+  mkdir -p "$bindir" "$d/src/main/java/demo" "$d/src/main/resources" "$m/core/src/main/java/demo" "$m/app/src/main/java/demo"
+  cat >"$bindir/gradle" <<'EOF'
+#!/bin/sh
+# stub gradle: log the arguments, answer the model query from $JV_STUB_MODEL, otherwise exit $JV_STUB_RC
+echo "$*" >>"$JV_STUB_LOG"
+for a in "$@"; do
+  case "$a" in -Djv.model.out=*) cp "$JV_STUB_MODEL" "${a#-Djv.model.out=}"; exit 0 ;; esac
+done
+exit "${JV_STUB_RC:-0}"
+EOF
+  chmod +x "$bindir/gradle"
+  export JV_STUB_LOG="$WORK/gradle-stub.log" JV_STUB_MODEL="$WORK/gradle-single.model.json"
+  : >"$JV_STUB_LOG"; PATH="$bindir:$PATH"
+
+  # ---- a single-project build
+  echo "plugins { id 'java' }" >"$d/build.gradle"
+  cat >"$d/src/main/java/demo/App.java" <<'EOF'
+package demo;
+public class App {
+    public static void main(String[] args) { System.out.println("Hello, jv"); }
+}
+EOF
+  echo hello >"$d/src/main/resources/r.txt"
+  printf '{"root":"%s","projects":[%s]}' "$d" "$(gradle_proj "$d" : app '[]' "[\"$d/src/main/resources\"]")" >"$JV_STUB_MODEL"
+
+  runjv "$d" compile;                      t_rc0 "compile from the model"
+  t_out "asks Gradle for the model" 'asking Gradle for the project model'
+  [ "$(stub_queries)" = 1 ] && ok "$CUR: gradle queried once" || bad "$CUR: gradle queried $(stub_queries) times, expected 1" "see $JV_STUB_LOG"
+  t_file "App.class built natively" "$d/build/classes/java/main/demo/App.class"
+  t_file "resources copied" "$d/build/resources/main/r.txt"
+  runjv "$d" compile;                      t_rc0 "second compile"; t_out "main classes up to date" 'up to date'
+  [ "$(stub_queries)" = 1 ] && ok "$CUR: cached model, gradle not started again" || bad "$CUR: gradle started again ($(stub_queries) queries)" "see $JV_STUB_LOG"
+  runjv "$d" -DskipTests compile;          t_rc0 "-DskipTests"
+  [ "$(stub_queries)" = 1 ] && ok "$CUR: -DskipTests does not change the model" || bad "$CUR: -DskipTests re-queried gradle" "see $JV_STUB_LOG"
+  echo "// edited" >>"$d/build.gradle"
+  runjv "$d" compile;                      t_rc0 "compile after a build script edit"
+  [ "$(stub_queries)" = 2 ] && ok "$CUR: editing build.gradle re-queries gradle" || bad "$CUR: expected 2 queries, got $(stub_queries)" "see $JV_STUB_LOG"
+  runjv "$d" -Dfoo=bar compile;            t_rc0 "-D property"
+  [ "$(stub_queries)" = 3 ] && grep 'jvModel' "$JV_STUB_LOG" | tail -1 | grep -q -- '-Dfoo=bar' \
+    && ok "$CUR: -Dfoo=bar re-queries gradle and is passed to it" || bad "$CUR: -Dfoo=bar not passed to the model query" "see $JV_STUB_LOG"
+  runjv "$d" package;                      t_rc0 "package"; t_file "jar built" "$d/build/libs/app-1.0.jar"
+  [ "$(java -jar "$d/build/libs/app-1.0.jar" 2>&1)" = "Hello, jv" ] && ok "$CUR: java -jar runs (Main-Class from the model's manifest)" || bad "$CUR: java -jar failed"
+  jar tf "$d/build/libs/app-1.0.jar" 2>/dev/null | grep -q 'demo/App.class' && ok "$CUR: jar contains the classes" || bad "$CUR: jar lacks App.class"
+  jar tf "$d/build/libs/app-1.0.jar" 2>/dev/null | grep -q 'r.txt' && ok "$CUR: jar contains the resources" || bad "$CUR: jar lacks r.txt"
+  runjv "$d" clean;                        t_rc0 "clean"; t_nofile "clean removes build/" "$d/build"; t_file "clean keeps the sources" "$d/src/main/java/demo/App.java"
+
+  # ---- goals Gradle must run itself
+  : >"$JV_STUB_LOG"
+  runjv "$d" install;                      t_rc0 "install goes to gradle"
+  grep -qx 'publishToMavenLocal' "$JV_STUB_LOG" && ok "$CUR: gradle received publishToMavenLocal" || bad "$CUR: install was not translated for gradle" "$(cat "$JV_STUB_LOG")"
+  : >"$JV_STUB_LOG"; export JV_GRADLE_ORACLE=0
+  runjv "$d" compile;                      t_rc0 "JV_GRADLE_ORACLE=0"
+  unset JV_GRADLE_ORACLE
+  grep -qx 'classes' "$JV_STUB_LOG" && ok "$CUR: JV_GRADLE_ORACLE=0 runs the bridge (classes task)" || bad "$CUR: bridge not used" "$(cat "$JV_STUB_LOG")"
+
+  # ---- a build jv cannot reproduce (Kotlin) falls back, and Gradle's exit code comes through
+  sed 's#org\.gradle\.api\.plugins\.JavaPlugin#org.jetbrains.kotlin.gradle.plugin.KotlinPluginWrapper#' "$JV_STUB_MODEL" >"$WORK/gradle-kotlin.model.json"
+  export JV_STUB_MODEL="$WORK/gradle-kotlin.model.json"; : >"$JV_STUB_LOG"
+  echo "// kotlin" >>"$d/build.gradle"
+  runjv "$d" compile;                      t_rc0 "unsupported build still succeeds"
+  t_out "says why it delegates" 'delegating to gradle'
+  grep -qx 'classes' "$JV_STUB_LOG" && ok "$CUR: gradle received the translated task" || bad "$CUR: gradle not run for the unsupported build" "$(cat "$JV_STUB_LOG")"
+  export JV_STUB_RC=5
+  runjv "$d" compile;                      t_rc "gradle's exit code propagates" 5
+  unset JV_STUB_RC
+
+  # ---- a multi-project build, declared out of order
+  echo "plugins { id 'java' }" >"$m/app/build.gradle"; echo "plugins { id 'java-library' }" >"$m/core/build.gradle"
+  printf "rootProject.name = 'multi'\ninclude 'core', 'app'\n" >"$m/settings.gradle"
+  cat >"$m/core/src/main/java/demo/Core.java" <<'EOF'
+package demo;
+public class Core { public static String greet() { return "Hello from core"; } }
+EOF
+  cat >"$m/app/src/main/java/demo/App.java" <<'EOF'
+package demo;
+public class App { public static void main(String[] a) { System.out.println(Core.greet()); } }
+EOF
+  export JV_STUB_MODEL="$WORK/gradle-multi.model.json"; : >"$JV_STUB_LOG"
+  printf '{"root":"%s","projects":[{"path":":","dir":"%s","name":"multi","plugins":[],"java":false},%s,%s]}' "$m" "$m" \
+    "$(gradle_proj "$m/app" :app app "[\"$m/core/build/libs/core-1.0.jar\"]")" "$(gradle_proj "$m/core" :core core)" >"$JV_STUB_MODEL"
+  runjv "$m" compile;                      t_rc0 "multi-project compile"
+  t_file "core built" "$m/core/build/classes/java/main/demo/Core.class"; t_file "app built" "$m/app/build/classes/java/main/demo/App.class"
+  printf '%s\n' "$LAST_OUT" | awk '/\[core\] compiled/{c=NR} /\[app\] compiled/{a=NR} END{exit !(c && a && c < a)}' \
+    && ok "$CUR: core built before app" || bad "$CUR: build order is not core, app" "see $LOG"
+  [ "$(java -cp "$m/app/build/classes/java/main:$m/core/build/classes/java/main" demo.App 2>&1)" = "Hello from core" ] && ok "$CUR: modules work together" || bad "$CUR: modules do not work together"
+  runjv "$m" compile;                      t_rc0 "second multi-project compile"
+  [ "$(stub_queries)" = 1 ] && ok "$CUR: cached although core's jar is not built yet" || bad "$CUR: gradle started again ($(stub_queries) queries): an unbuilt sibling jar invalidated the cache" "see $JV_STUB_LOG"
+  rm -rf "$m/core/build" "$m/app/build"
+  runjv "$m" -pl core compile;             t_rc0 "-pl core"; t_file "-pl core builds core" "$m/core/build/classes/java/main/demo/Core.class"
+  t_nofile "-pl core leaves app alone" "$m/app/build/classes"
+  runjv "$m" -pl app compile;              t_rc0 "-pl app"; t_file "-pl app builds app" "$m/app/build/classes/java/main/demo/App.class"
+  runjv "$m" -pl app classpath compile;    t_rc0 "classpath of one project"
+  t_cp_has "core's classes stand in for its jar" "$LAST_OUT" 'core/build/classes/java/main'; t_cp_not "no unbuilt core jar" "$LAST_OUT" 'core-1\.0\.jar'
+  runjv "$m" classpath;                    t_rcnz "classpath at the root is ambiguous"
+  runjv "$m" -pl app package;              t_rc0 "-pl app package"; t_file "app jar" "$m/app/build/libs/app-1.0.jar"
+  runjv "$m" clean;                        t_rc0 "clean all projects"
+  t_nofile "core build/ removed" "$m/core/build"; t_nofile "app build/ removed" "$m/app/build"
+
+  PATH=$oldpath; unset JV_STUB_LOG JV_STUB_MODEL JV_STUB_RC JV_GRADLE_ORACLE
+}
+
+# The same flow against a real Gradle, when one is installed and runs here.
+sc_gradle_real() {
+  begin gradle_real
+  if ! command -v gradle >/dev/null 2>&1; then skip "real Gradle" "gradle not installed"; return; fi
+  if ! gradle --version >/dev/null 2>&1; then skip "real Gradle" "gradle does not start here (JDK too new for this Gradle?)"; return; fi
+  local d="$WORK/gradle-real" ref="$WORK/gradle-real-ref"
+  mkdir -p "$d/src/main/java/demo" "$d/src/main/resources"
+  printf "plugins { id 'java' }\nversion = '1.0'\njar { manifest { attributes 'Main-Class': 'demo.App' } }\n" >"$d/build.gradle"
+  echo "rootProject.name = 'realapp'" >"$d/settings.gradle"
+  cat >"$d/src/main/java/demo/App.java" <<'EOF'
+package demo;
+public class App {
+    public static String greet(String n) { return "Hello, " + n; }
+    public static void main(String[] args) { System.out.println(greet("jv")); }
+}
+EOF
+  echo hello >"$d/src/main/resources/r.txt"
+  rm -rf "$ref"; cp -R "$d" "$ref"
+  (cd "$ref" && gradle -q --offline classes jar) >"$LOGDIR/gradle-ref.log" 2>&1 \
+    || { skip "real Gradle" "gradle could not build the sample project offline (see $LOGDIR/gradle-ref.log)"; return; }
+
+  runjv "$d" -o compile;                   t_rc0 "compile through the real Gradle model"
+  t_out "asks Gradle for the model" 'asking Gradle for the project model'
+  t_file "App.class" "$d/build/classes/java/main/demo/App.class"; t_file "resource" "$d/build/resources/main/r.txt"
+  diff <(cd "$ref/build/classes" && find . -name '*.class' | sort) <(cd "$d/build/classes" && find . -name '*.class' | sort) >"$LOGDIR/gradle-classes.diff" 2>&1 \
+    && ok "$CUR: same class files as gradle classes" || bad "$CUR: class files differ from gradle's" "see $LOGDIR/gradle-classes.diff"
+  runjv "$d" -o compile;                   t_rc0 "second compile"; t_noout "model cached, gradle not started" 'asking Gradle'
+  runjv "$d" -o package;                   t_rc0 "package"; t_file "jar" "$d/build/libs/realapp-1.0.jar"
+  [ "$(java -jar "$d/build/libs/realapp-1.0.jar" 2>&1)" = "Hello, jv" ] && ok "$CUR: java -jar runs" || bad "$CUR: java -jar failed"
+  runjv "$d" -o classpath compile;         t_rc0 "classpath"
+  runjv "$d" clean;                        t_rc0 "clean"; t_nofile "build/ removed" "$d/build"
+  runjv "$d" -o tasks;                     t_rc0 "an arbitrary task runs through gradle"
+}
+
 sc_sigterm() {
   begin sigterm
   local d="$WORK/sig" repo="$WORK/repo-sig"
@@ -662,7 +823,7 @@ if [ "$SKIP_E2E" = 0 ]; then
       section "End-to-end scenarios"; skip "all network scenarios and corpus" "cannot reach repo1.maven.org (use --quick for offline-only checks)"
     else
       if [ "$TIER" != corpus ]; then
-        for s in basic single failing_test compile_error scopes ranges profiles reactor offline errors fallback sigterm concurrent graphs; do
+        for s in basic single failing_test compile_error scopes ranges profiles reactor offline errors fallback gradle gradle_real sigterm concurrent graphs; do
           want "$s" && "sc_$s"
         done
       fi

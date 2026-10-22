@@ -194,6 +194,7 @@ func run(args []string) int {
 		errf("%v", err)
 		return 1
 	}
+	defer func() { _ = os.Chdir(root) }() // builds chdir into modules; never leave the process there
 
 	hasPom := false
 	if _, err := os.Stat(filepath.Join(root, "pom.xml")); err == nil {
@@ -368,7 +369,6 @@ func run(args []string) int {
 			}
 		}
 	}
-	_ = os.Chdir(root)
 	logf("done in %v", time.Since(start).Round(time.Millisecond))
 	return 0
 }

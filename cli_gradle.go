@@ -80,7 +80,11 @@ func runGradleNative(o *cliOpts, args []string, cwd, gradleCmd string) (code int
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	start := time.Now()
-	defer func() { _ = os.Chdir(cwd) }()
+	orig, werr := os.Getwd() // restore where the process really was; cwd is just the project to build
+	if werr != nil {
+		orig = cwd
+	}
+	defer func() { _ = os.Chdir(orig) }()
 
 	extra := gradleExtraArgs(args)
 	key, err := gradle.CacheKey(root, extra)

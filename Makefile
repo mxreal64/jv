@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-only
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 .PHONY: build test vet fmt
