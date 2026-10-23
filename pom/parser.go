@@ -116,14 +116,22 @@ type PluginConfigChild struct {
 	XMLName xml.Name
 }
 
-// PluginConfig keeps the few compiler settings jv understands and records every
-// other child element so unsupported configuration can be detected.
+// PluginConfig holds plugin <configuration> that jv acts on.
+// Compiler fields: release, source, target, encoding.
+// Surefire fields: includes, excludes, groups, excludedGroups, argLine, systemPropertyVariables.
+// Anything else lands in Other, which triggers delegation.
 type PluginConfig struct {
-	Release  string              `xml:"release"`
-	Source   string              `xml:"source"`
-	Target   string              `xml:"target"`
-	Encoding string              `xml:"encoding"`
-	Other    []PluginConfigChild `xml:",any"`
+	Release            string              `xml:"release"`
+	Source             string              `xml:"source"`
+	Target             string              `xml:"target"`
+	Encoding           string              `xml:"encoding"`
+	Includes           []string            `xml:"includes>include"`
+	Excludes           []string            `xml:"excludes>exclude"`
+	Groups             string              `xml:"groups"`
+	ExcludedGroups     string              `xml:"excludedGroups"`
+	ArgLine            string              `xml:"argLine"`
+	SystemPropertyVars Properties          `xml:"systemPropertyVariables"`
+	Other              []PluginConfigChild `xml:",any"`
 }
 
 type Plugin struct {
@@ -147,6 +155,46 @@ type Build struct {
 	Resources           []Resource `xml:"resources>resource"`
 	TestResources       []Resource `xml:"testResources>testResource"`
 	Plugins             []Plugin   `xml:"plugins>plugin"`
+	// PluginManagement: flat slice, keyed by POM path when merged across parent chain.
+	PluginManagement []Plugin `xml:"pluginManagement>plugins>plugin"`
+}
+
+// effectivePlugins merges <pluginManagement> defaults with explicit <plugins>.
+// Explicit entries win; management-only entries for the three default-bound plugins
+// (compiler, surefire, jar) are always included so their config is visible.
+func (b Build) effectivePlugins() []Plugin {
+	mgmt := map[string]Plugin{}
+	for _, p := range b.PluginManagement {
+		a := strings.TrimSpace(p.ArtifactID)
+		if a != "" {
+			mgmt[a] = p
+		}
+	}
+	explicit := map[string]bool{}
+	var out []Plugin
+	for _, p := range b.Plugins {
+		a := strings.TrimSpace(p.ArtifactID)
+		explicit[a] = true
+		if m, ok := mgmt[a]; ok && pluginConfigEmpty(p.Configuration) {
+			p.Configuration = m.Configuration
+		}
+		out = append(out, p)
+	}
+	for _, a := range []string{"maven-compiler-plugin", "maven-surefire-plugin", "maven-jar-plugin"} {
+		if !explicit[a] {
+			if m, ok := mgmt[a]; ok {
+				out = append(out, m)
+			}
+		}
+	}
+	return out
+}
+
+func pluginConfigEmpty(c PluginConfig) bool {
+	return c.Release == "" && c.Source == "" && c.Target == "" && c.Encoding == "" &&
+		len(c.Includes) == 0 && len(c.Excludes) == 0 &&
+		c.Groups == "" && c.ExcludedGroups == "" && c.ArgLine == "" &&
+		len(c.SystemPropertyVars.Items) == 0 && len(c.Other) == 0
 }
 
 func resourcesUnsupported(rs []Resource, def string) bool {
@@ -160,6 +208,14 @@ func resourcesUnsupported(rs []Resource, def string) bool {
 }
 
 var ignorableCompilerConfig = map[string]bool{"showWarnings": true, "showDeprecation": true, "optimize": true}
+
+var ignorableSurefireConfig = map[string]bool{
+	"includes": true, "excludes": true,
+	"groups": true, "excludedGroups": true,
+	"argLine": true, "systemPropertyVariables": true,
+	"useFile": true, "printSummary": true, "trimStackTrace": true,
+	"reportFormat": true, "disableXmlReport": true,
+}
 
 // Unsupported lists <build> settings that change what Maven would produce but that jv
 // does not honour, so callers can delegate to mvn (or warn) instead of silently
@@ -181,19 +237,35 @@ func (b Build) Unsupported() []string {
 	if resourcesUnsupported(b.TestResources, "src/test/resources") {
 		out = append(out, "build/testResources")
 	}
-	for _, p := range b.Plugins {
+	for _, p := range b.effectivePlugins() {
 		name := strings.TrimSpace(p.ArtifactID)
 		isCompiler := name == "maven-compiler-plugin"
+		isSurefire := name == "maven-surefire-plugin"
 		c := p.Configuration
 		var extra []string
 		for _, o := range c.Other {
-			if isCompiler && ignorableCompilerConfig[o.XMLName.Local] {
+			switch {
+			case isCompiler && ignorableCompilerConfig[o.XMLName.Local]:
+				continue
+			case isSurefire && ignorableSurefireConfig[o.XMLName.Local]:
 				continue
 			}
 			extra = append(extra, o.XMLName.Local)
 		}
-		if !isCompiler && (strings.TrimSpace(c.Release) != "" || strings.TrimSpace(c.Source) != "" || strings.TrimSpace(c.Target) != "" || strings.TrimSpace(c.Encoding) != "") {
+		if !isCompiler && !isSurefire &&
+			(strings.TrimSpace(c.Release) != "" || strings.TrimSpace(c.Source) != "" ||
+				strings.TrimSpace(c.Target) != "" || strings.TrimSpace(c.Encoding) != "") {
 			extra = append(extra, "release/source/target/encoding")
+		}
+		if isSurefire {
+			if strings.Contains(c.ArgLine, "@{") {
+				extra = append(extra, "argLine uses @{...} late binding")
+			}
+			for _, g := range append(append([]string(nil), c.Includes...), c.Excludes...) {
+				if strings.HasPrefix(strings.TrimSpace(g), "%") {
+					extra = append(extra, "pattern "+strings.TrimSpace(g)+" (only Ant-style globs)")
+				}
+			}
 		}
 		if len(extra) > 0 {
 			out = append(out, name+": configuration ("+strings.Join(extra, ", ")+")")
@@ -209,7 +281,7 @@ func (b Build) Unsupported() []string {
 // equivalent Maven properties.
 func (b Build) CompilerProps() map[string]string {
 	out := map[string]string{}
-	for _, p := range b.Plugins {
+	for _, p := range b.effectivePlugins() {
 		if strings.TrimSpace(p.ArtifactID) != "maven-compiler-plugin" {
 			continue
 		}
@@ -228,6 +300,42 @@ func (b Build) CompilerProps() map[string]string {
 		}
 	}
 	return out
+}
+
+// SurefireCfg holds the surefire settings that jv translates to launcher flags.
+type SurefireCfg struct {
+	Includes       []string
+	Excludes       []string
+	Groups         string
+	ExcludedGroups string
+	ArgLine        string
+	SysProps       map[string]string
+}
+
+// SurefireConfig returns surefire config from the effective maven-surefire-plugin entry.
+// Returns a zero SurefireCfg when surefire is not configured; caller applies defaults.
+func (b Build) SurefireConfig() SurefireCfg {
+	for _, p := range b.effectivePlugins() {
+		if strings.TrimSpace(p.ArtifactID) != "maven-surefire-plugin" {
+			continue
+		}
+		c := p.Configuration
+		cfg := SurefireCfg{
+			Includes:       c.Includes,
+			Excludes:       c.Excludes,
+			Groups:         strings.TrimSpace(c.Groups),
+			ExcludedGroups: strings.TrimSpace(c.ExcludedGroups),
+			ArgLine:        strings.TrimSpace(c.ArgLine),
+		}
+		for _, sp := range c.SystemPropertyVars.Items {
+			if cfg.SysProps == nil {
+				cfg.SysProps = map[string]string{}
+			}
+			cfg.SysProps[sp.XMLName.Local] = strings.TrimSpace(sp.Value)
+		}
+		return cfg
+	}
+	return SurefireCfg{}
 }
 
 type Model struct {

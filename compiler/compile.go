@@ -167,12 +167,42 @@ func Compile(ctx context.Context, srcDir, outDir string, classpath []string, opt
 	return true, os.WriteFile(stamp, []byte(sig), 0o644)
 }
 
-// CopyResources copies src into dst (no filtering), skipping up-to-date files.
-func CopyResources(src, dst string) error {
-	if st, err := os.Stat(src); err != nil || !st.IsDir() {
+// resourceManifestPath returns the manifest file tracking what CopyResources copied.
+func resourceManifestPath(dst string) string {
+	return filepath.Join(dst, ".jv-resources")
+}
+
+func readManifest(path string) map[string]bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
 		return nil
 	}
-	return filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+	out := map[string]bool{}
+	for _, line := range strings.Split(string(data), "\n") {
+		if line != "" {
+			out[line] = true
+		}
+	}
+	return out
+}
+
+// CopyResources copies src into dst (no filtering), skipping up-to-date files.
+// Tracks copied files in .jv-resources and removes stale files from previous runs.
+func CopyResources(src, dst string) error {
+	manifestPath := resourceManifestPath(dst)
+	if st, err := os.Stat(src); err != nil || !st.IsDir() {
+		if old := readManifest(manifestPath); len(old) > 0 {
+			for rel := range old {
+				_ = os.Remove(filepath.Join(dst, rel))
+			}
+			pruneEmptyDirs(dst)
+			_ = os.Remove(manifestPath)
+		}
+		return nil
+	}
+	oldManifest := readManifest(manifestPath)
+	newManifest := map[string]bool{}
+	if err := filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -181,11 +211,12 @@ func CopyResources(src, dst string) error {
 		if d.IsDir() {
 			return os.MkdirAll(target, 0o755)
 		}
+		newManifest[rel] = true
 		si, err := d.Info()
 		if err != nil {
 			return err
 		}
-		if ti, err := os.Stat(target); err == nil && !ti.ModTime().Before(si.ModTime()) && ti.Size() == si.Size() {
+		if ti, err := os.Stat(target); err == nil && ti.Size() == si.Size() && ti.ModTime().Equal(si.ModTime()) {
 			return nil
 		}
 		in, err := os.Open(p)
@@ -201,8 +232,43 @@ func CopyResources(src, dst string) error {
 			out.Close()
 			return err
 		}
-		return out.Close()
+		if err := out.Close(); err != nil {
+			return err
+		}
+		_ = os.Chtimes(target, si.ModTime(), si.ModTime())
+		return nil
+	}); err != nil {
+		return err
+	}
+	for rel := range oldManifest {
+		if !newManifest[rel] {
+			_ = os.Remove(filepath.Join(dst, rel))
+		}
+	}
+	if len(oldManifest) > 0 {
+		pruneEmptyDirs(dst)
+	}
+	lines := make([]string, 0, len(newManifest))
+	for rel := range newManifest {
+		lines = append(lines, rel)
+	}
+	sort.Strings(lines)
+	_ = os.WriteFile(manifestPath, []byte(strings.Join(lines, "\n")), 0o644)
+	return nil
+}
+
+// pruneEmptyDirs removes empty subdirectories of root (deepest first).
+func pruneEmptyDirs(root string) {
+	var dirs []string
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, _ error) error {
+		if d != nil && d.IsDir() && p != root {
+			dirs = append(dirs, p)
+		}
+		return nil
 	})
+	for i := len(dirs) - 1; i >= 0; i-- {
+		_ = os.Remove(dirs[i])
+	}
 }
 
 const procService = "META-INF/services/javax.annotation.processing.Processor"

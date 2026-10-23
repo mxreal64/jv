@@ -252,9 +252,17 @@ func (l *Loader) get(ctx context.Context, b repoRef, url string) (*http.Response
 	req.Header.Set("User-Agent", "jv")
 	if u, p := l.Settings.Auth(b.ID); u != "" && b.Trusted {
 		if config.IsEncrypted(p) {
-			return nil, fmt.Errorf("%w: the password for server %q in settings.xml is encrypted, which is not supported (use ${env.VAR})", errPermanent, b.ID)
+			decrypted, derr := config.DecryptPassword(p)
+			if derr != nil {
+				if _, seen := l.warned.LoadOrStore("decryptWarn:"+b.ID, true); !seen {
+					l.warnf("could not decrypt password for server %q: %v — sending no credentials", b.ID, derr)
+				}
+			} else {
+				req.SetBasicAuth(u, decrypted)
+			}
+		} else {
+			req.SetBasicAuth(u, p)
 		}
-		req.SetBasicAuth(u, p)
 	}
 	return l.client.Do(req)
 }

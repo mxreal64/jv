@@ -14,7 +14,8 @@ import (
 
 // Module is one project in the reactor (a single project is a reactor of one).
 type Module struct {
-	Dir         string // absolute
+	Dir         string // absolute directory containing the POM
+	POMFile     string // absolute path to the POM (may differ from Dir/pom.xml)
 	Eff         *Effective
 	Key         string // lock key: own POM chain + the whole reactor's POMs
 	Classes     string
@@ -23,31 +24,41 @@ type Module struct {
 
 func (m *Module) GAV() string { return m.Eff.G + ":" + m.Eff.A + ":" + m.Eff.V }
 
-// ListModuleDirs returns root and, recursively, every <modules> directory (absolute paths),
-// including modules declared by active profiles (ids = -P, props = -D).
-func ListModuleDirs(root string, ids map[string]bool, props map[string]string) ([]string, error) {
-	var out []string
+type moduleRef struct {
+	Dir     string
+	POMFile string
+}
+
+// ListModules returns the root module and every recursively-declared sub-module as
+// (dir, pomFile) pairs. A <module> entry ending in .xml names a non-default POM.
+func ListModules(root string, ids map[string]bool, props map[string]string) ([]moduleRef, error) {
+	var out []moduleRef
 	seen := map[string]bool{}
-	var walk func(dir string) error
-	walk = func(dir string) error {
-		dir = filepath.Clean(dir)
-		if seen[dir] {
+	var walk func(dir, pomFile string) error
+	walk = func(dir, pomFile string) error {
+		pomFile = filepath.Clean(pomFile)
+		if seen[pomFile] {
 			return nil
 		}
-		seen[dir] = true
-		m, err := pom.ParsePOM(filepath.Join(dir, "pom.xml"))
+		seen[pomFile] = true
+		m, err := pom.ParsePOM(pomFile)
 		if err != nil {
-			return fmt.Errorf("%s: %w", dir, err)
+			return fmt.Errorf("%s: %w", pomFile, err)
 		}
 		m.ApplyProfilesEnv(pom.NewEnv(ids, props, dir))
-		out = append(out, dir)
+		out = append(out, moduleRef{Dir: dir, POMFile: pomFile})
 		for _, mod := range m.Modules {
 			mod = strings.TrimSpace(mod)
 			p := filepath.Join(dir, filepath.FromSlash(mod))
+			var childDir, childPOM string
 			if strings.HasSuffix(mod, ".xml") {
-				p = filepath.Dir(p)
+				childDir = filepath.Dir(p)
+				childPOM = p
+			} else {
+				childDir = p
+				childPOM = filepath.Join(p, "pom.xml")
 			}
-			if err := walk(p); err != nil {
+			if err := walk(childDir, childPOM); err != nil {
 				return err
 			}
 		}
@@ -57,27 +68,40 @@ func ListModuleDirs(root string, ids map[string]bool, props map[string]string) (
 	if err != nil {
 		return nil, err
 	}
-	return out, walk(abs)
+	return out, walk(abs, filepath.Join(abs, "pom.xml"))
+}
+
+// ListModuleDirs is the legacy entry point (returns only dirs, for clean).
+func ListModuleDirs(root string, ids map[string]bool, props map[string]string) ([]string, error) {
+	refs, err := ListModules(root, ids, props)
+	if err != nil {
+		return nil, err
+	}
+	dirs := make([]string, len(refs))
+	for i, r := range refs {
+		dirs[i] = r.Dir
+	}
+	return dirs, nil
 }
 
 // Discover loads the effective model of every module. Modules that import a sibling BOM
 // are retried once their siblings are registered.
 func (l *Loader) Discover(root string) ([]*Module, error) {
-	dirs, err := ListModuleDirs(root, l.ProfileIDs, l.UserProps)
+	refs, err := ListModules(root, l.ProfileIDs, l.UserProps)
 	if err != nil {
 		return nil, err
 	}
-	mods := make([]*Module, len(dirs))
-	keys := make([]string, len(dirs))
+	mods := make([]*Module, len(refs))
+	keys := make([]string, len(refs))
 	var firstErr error
-	for pending := len(dirs); pending > 0; {
+	for pending := len(refs); pending > 0; {
 		progress := 0
-		for i, d := range dirs {
+		for i, ref := range refs {
 			if mods[i] != nil {
 				continue
 			}
 			h := NewHash()
-			eff, err := l.LoadRoot(filepath.Join(d, "pom.xml"), h)
+			eff, err := l.LoadRoot(ref.POMFile, h)
 			if err != nil {
 				if firstErr == nil {
 					firstErr = err
@@ -85,10 +109,11 @@ func (l *Loader) Discover(root string) ([]*Module, error) {
 				continue
 			}
 			mods[i] = &Module{
-				Dir:         d,
+				Dir:         ref.Dir,
+				POMFile:     ref.POMFile,
 				Eff:         eff,
-				Classes:     filepath.Join(d, "target", "classes"),
-				TestClasses: filepath.Join(d, "target", "test-classes"),
+				Classes:     filepath.Join(ref.Dir, "target", "classes"),
+				TestClasses: filepath.Join(ref.Dir, "target", "test-classes"),
 			}
 			keys[i] = HashKey(h)
 			l.Register([]*Module{mods[i]})
@@ -99,7 +124,7 @@ func (l *Loader) Discover(root string) ([]*Module, error) {
 			return nil, firstErr
 		}
 		if pending > 0 {
-			l.resetCaches() // earlier failures may have been cached
+			l.resetCaches()
 			firstErr = nil
 		}
 	}

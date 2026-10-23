@@ -22,6 +22,7 @@ type Effective struct {
 	Props     map[string]string
 	Deps      []pom.Dependency
 	Mgmt      map[string]pom.Dependency
+	Build     pom.Build
 
 	// Unsupported lists <build> settings (own or inherited) that jv ignores.
 	Unsupported []string
@@ -36,6 +37,7 @@ type raw struct {
 	props      map[string]string
 	mgmt       []pom.Dependency
 	deps       []pom.Dependency
+	build      pom.Build
 
 	unsupported []string
 }
@@ -59,6 +61,27 @@ func mergeDeps(parent, child []pom.Dependency) []pom.Dependency {
 	return out
 }
 
+// mergePluginManagement merges parent pluginManagement into child: child entries win per artifactId.
+func mergePluginManagement(parent, child []pom.Plugin) []pom.Plugin {
+	if len(parent) == 0 {
+		return child
+	}
+	if len(child) == 0 {
+		return parent
+	}
+	childIdx := map[string]bool{}
+	for _, p := range child {
+		childIdx[strings.TrimSpace(p.ArtifactID)] = true
+	}
+	out := append([]pom.Plugin{}, child...)
+	for _, p := range parent {
+		if !childIdx[strings.TrimSpace(p.ArtifactID)] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func mergeRaw(m *pom.Model, parent *raw) *raw {
 	r := &raw{g: m.GroupID, a: m.ArtifactID, v: m.Version, packaging: m.Packaging, props: map[string]string{}}
 	if m.Parent != nil {
@@ -76,6 +99,10 @@ func mergeRaw(m *pom.Model, parent *raw) *raw {
 	}
 	for k, v := range m.Build.CompilerProps() { // explicit plugin configuration wins over properties
 		r.props[k] = v
+	}
+	r.build = m.Build
+	if parent != nil {
+		r.build.PluginManagement = mergePluginManagement(parent.build.PluginManagement, m.Build.PluginManagement)
 	}
 	if parent != nil {
 		r.unsupported = append(r.unsupported, parent.unsupported...)
@@ -276,8 +303,13 @@ func (l *Loader) finalize(r *raw, chain []string) (*Effective, error) {
 			props[k] = pom.Interpolate(v, props)
 		}
 	}
+	for k, v := range r.build.CompilerProps() {
+		if props[k] == "" {
+			props[k] = pom.Interpolate(v, props)
+		}
+	}
 
-	eff := &Effective{G: r.g, A: r.a, V: r.v, Packaging: r.packaging, Props: props, Mgmt: map[string]pom.Dependency{}, Unsupported: uniq(r.unsupported)}
+	eff := &Effective{G: r.g, A: r.a, V: r.v, Packaging: r.packaging, Props: props, Mgmt: map[string]pom.Dependency{}, Build: r.build, Unsupported: uniq(r.unsupported)}
 	var imports []pom.Dependency
 	for _, d := range r.mgmt {
 		d = interpDep(d, props)

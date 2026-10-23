@@ -26,17 +26,32 @@ jv --version | -h
 - **Remote `-SNAPSHOT` dependencies** (unique and non-unique layouts); `-U` re-checks them.
 - **Multi-module reactors** in dependency order; siblings resolve to their build output. `-pl a,b`
   builds the named modules plus the siblings they need (so `-am` is accepted and ignored) and `clean`
-  with `-pl` cleans only those modules.
+  with `-pl` cleans only those modules. A `<module>` may name a non-default POM file
+  (`<module>sub/alt.xml</module>`); `install` publishes that file.
+- **`clean` in any position**: a leading `clean` takes a fast path that needs no network or POM
+  resolution; a `clean` anywhere else (`jv install clean`) runs at its position in the goal list.
 - **`~/.m2/settings.xml`**: mirrors, credentials, `localRepository`, `<profiles>` (repositories and
-  properties), `<proxies>`; POM-declared repositories; SHA-1 verification.
+  properties), `<proxies>`; POM-declared repositories; SHA-1 verification. Encrypted server passwords
+  (`{...}`) are decrypted with the master password in `~/.m2/settings-security.xml` (see Repositories
+  and security).
 - **Build steps**: parallel downloads (stalled transfers abort after 60 s, large files have no overall
   limit), a resolution cache (`.jv/lock.json`), skip-if-unchanged `javac` (source size/mtime based),
-  resource copying, JUnit Platform tests (the launcher is fetched automatically, XML reports go to
-  `target/surefire-reports`), reproducible jars with directory entries, `install` into the local repository.
+  resource copying that also removes resources you deleted from `src/*/resources` (tracked in
+  `.jv-resources`; compiled classes are never touched), JUnit Platform tests (the launcher is fetched
+  automatically, XML reports go to `target/surefire-reports`), reproducible jars with directory
+  entries, `install` into the local repository.
 - **Compiler settings**: `maven.compiler.*` properties and `maven-compiler-plugin`
   `<release>`, `<source>`, `<target>`, `<encoding>`. Annotation processors on the classpath keep working
   on javac 23+ (jv passes `-proc:full` on javac 21+). javac itself is started with C1-only JIT and the
   serial GC for faster startup.
+- **Plugin management**: `<pluginManagement>` entries for `maven-compiler-plugin`,
+  `maven-surefire-plugin` and `maven-jar-plugin` are read (child entries replace the parent's per
+  artifactId), because Maven applies them to the default lifecycle without the plugin being declared.
+- **Test selection (`maven-surefire-plugin`)**: `<includes>`/`<excludes>` (Ant globs such as
+  `**/*IT.java`; explicit includes replace the defaults `**/Test*.java`, `**/*Test.java`,
+  `**/*Tests.java`, `**/*TestCase.java`; nested and anonymous classes are never test classes),
+  `<groups>`/`<excludedGroups>` (JUnit tags), `<argLine>` and `<systemPropertyVariables>`.
+  `-Dtest=...` overrides includes/excludes, as in Surefire.
 - **Flags**: `-DskipTests`, `-Dmaven.test.skip`, `-Dtest=...`, `-Dmaven.test.failure.ignore=true`.
   `-B -e -ntp -V -am` are accepted and ignored. `-X` also reports whether a build ran natively.
 
@@ -47,7 +62,10 @@ jv --version | -h
 - POMs, including inherited parent POMs, that customise the build in ways jv can't reproduce:
   `sourceDirectory`/`testSourceDirectory`, `finalName`, non-default or filtered `resources`, compiler
   configuration other than release/source/target/encoding (`compilerArgs`, `annotationProcessorPaths`,
-  ...), and any plugin `<executions>` or plugin configuration (shade, spring-boot repackage, ...).
+  ...), surefire configuration beyond the list above (`forkCount`, `parallel`, ...), `%regex[...]`
+  or `%ant[...]` test patterns, an `<argLine>` that uses `@{...}` late binding (jacoco), the
+  `maven-jar-plugin` configuration (including from `<pluginManagement>`), and any plugin
+  `<executions>` or plugin configuration (shade, spring-boot repackage, ...).
   jv prints which setting caused the delegation. `JV_IGNORE_BUILD_CONFIG=1` builds natively anyway
   (a warning is printed instead).
 
@@ -80,6 +98,13 @@ start Gradle at all.
 - Downloads are verified against the repository's `.sha1` when it provides one (`-X` shows artifacts
   that couldn't be verified). That detects corruption, not a malicious repository;
   `JV_REQUIRE_CHECKSUMS=1` refuses artifacts without a checksum.
+- **Encrypted passwords**: a server `<password>` of the form `{...}` is decrypted with the master
+  password from `~/.m2/settings-security.xml` (itself encrypted, as written by
+  `mvn --encrypt-master-password`). jv implements Maven's plexus-cipher AES scheme. A test
+  (`config/decrypt_maven_test.go`) encrypts with your installed `mvn` and checks that jv decrypts it;
+  it is skipped when `mvn` is absent, and a failure means the cipher layout differs from that Maven
+  version. If decryption fails at build time jv warns once and sends **no** credentials rather than
+  a wrong password. The decrypted password lives in memory only and is never logged.
 
 ## Environment
 | Variable | Meaning |
@@ -92,14 +117,20 @@ start Gradle at all.
 | `JAVA_HOME` | JDK used for `javac`/`java` (wins over `PATH`, like Maven and Gradle) |
 
 ## Known limitations
-- Encrypted `settings.xml` passwords are not decrypted (use `${env.VAR}` instead).
-- Compilation is whole-module, not per-class. Resources deleted from `src/*/resources` stay in
-  `target/` until the next recompile or `clean`.
+- `-f`/`--file` is not handled natively (it is delegated to `mvn`); a non-default POM is only
+  supported as a `<module>` entry.
+- Password decryption reads `~/.m2/settings-security.xml` only (no `-Dsettings.security`, no
+  `<relocation>` chains beyond one hop) and covers server passwords, not proxy passwords.
+- Surefire: only Ant-style `includes`/`excludes`; a pattern without a leading `**/` matches the default
+  package only (as in Surefire). An `<argLine>` that still contains `${...}` after interpolation
+  drops those tokens. `groups` are passed as JUnit tags (comma = OR).
+- Compilation is whole-module, not per-class.
 - Plugin-driven code generation and resource filtering are delegated (see above).
-- `<module>` entries that point at a non-default POM file name.
-- `clean` always runs before the other goals, whatever order they were typed in.
-- Test discovery uses the JUnit console launcher's defaults (`*Test`, `*Tests`, `Test*`), not
-  Surefire's include/exclude configuration; TestNG is not supported natively.
+- `clean` always takes the fast path when it is the first goal; `jv clean install` therefore cleans
+  every module before any POM is resolved (which is also what Maven does).
+- Goals run goal-by-goal across all modules (Maven runs module-by-module); results are the same for
+  successful builds, log order and failure behaviour differ.
+- TestNG is not supported natively; test discovery uses JUnit Platform engines found on the classpath.
 - Classpath order follows Maven's tree order but is not guaranteed identical in every edge case
   (the set of jars is).
 
@@ -108,7 +139,7 @@ start Gradle at all.
 
 | Tier | What runs |
 |---|---|
-| `--quick` | gofmt, `go vet`, `go test -race` (parser, versions, snapshots, settings, packager, compiler helpers, CLI, Gradle model and bridge, resolution semantics against an in-process fake repository), cross-compiles for linux/darwin/windows |
+| `--quick` | gofmt, `go vet`, `go test -race` (parser, plugin config, versions, snapshots, settings and password decryption, packager, resource syncing, test-selection patterns, module discovery, CLI, Gradle model and bridge, resolution semantics against an in-process fake repository), cross-compiles for linux/darwin/windows |
 | default | quick + end-to-end scenarios against Maven Central: incremental builds, tests passing/failing, compile errors, scopes, exclusions, version ranges, profiles, reactor builds with BOM + parent POMs, `install` then consuming the installed artifacts, offline mode, error messages, delegation, SIGTERM safety, concurrent runs sharing a cold repository, large real dependency graphs, and Gradle (a stub `gradle` that answers the model query, so no Gradle is needed: model caching and invalidation, `-D`, package/clean, fallback and exit codes, multi-project builds; plus a real-Gradle run when Gradle is installed) |
 | `--full` | default + heavier graphs (hadoop, hibernate, netty, aws sdk) + a corpus of real open-source projects |
 | `--corpus-only` | just the corpus |
@@ -126,3 +157,7 @@ binaries, the license and checksums via GoReleaser.
 jv is free software, licensed under the **GNU General Public License, version 3 only**
 (SPDX: `GPL-3.0-only`); see [LICENSE](LICENSE). Copyright (C) 2026 jv contributors. Every source file
 carries an SPDX header, which CI checks. Contributions are accepted under the same license.
+
+Earlier revisions of this repository were published under the MIT License; copies obtained under it
+stay available under it. jv runs `mvn`, `gradle`, `java` and `javac` as separate programs and downloads
+the JUnit console launcher at runtime; none of them is linked into or shipped with jv.

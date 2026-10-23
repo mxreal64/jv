@@ -265,17 +265,16 @@ func run(args []string) int {
 		errf("%v", err)
 		return 1
 	}
-	var build []string
-	for _, g := range o.goals {
-		if g == "clean" && len(o.pl) == 0 {
-			for _, d := range dirs {
-				_ = os.RemoveAll(filepath.Join(d, "target"))
-				_ = os.RemoveAll(filepath.Join(d, ".jv"))
-			}
-			logf("cleaned %d module(s)", len(dirs))
-		} else {
-			build = append(build, g) // "clean" with -pl is handled per selected module below
+	// clean is positional: leading clean (no -pl) runs before module loading for speed.
+	// clean anywhere else in the goal list runs in the build loop at its position.
+	build := append([]string(nil), o.goals...)
+	if len(build) > 0 && build[0] == "clean" && len(o.pl) == 0 {
+		for _, d := range dirs {
+			_ = os.RemoveAll(filepath.Join(d, "target"))
+			_ = os.RemoveAll(filepath.Join(d, ".jv"))
 		}
+		logf("cleaned %d module(s)", len(dirs))
+		build = build[1:]
 	}
 	if len(build) == 0 {
 		return 0
@@ -326,11 +325,14 @@ func run(args []string) int {
 		return 1
 	}
 	for _, goal := range build {
-		if goal == "clean" { // only reached with -pl: clean just the selected modules
-			sel, err := resolver.SelectOnly(ordered, root, o.pl)
-			if err != nil {
-				errf("%v", err)
-				return 1
+		if goal == "clean" { // a clean that is not the first goal (or any clean with -pl) runs here, at its position
+			sel := ordered
+			if len(o.pl) > 0 {
+				var serr error
+				if sel, serr = resolver.SelectOnly(ordered, root, o.pl); serr != nil {
+					errf("%v", serr)
+					return 1
+				}
 			}
 			for _, m := range sel {
 				_ = os.RemoveAll(filepath.Join(m.Dir, "target"))
@@ -415,7 +417,7 @@ func buildModule(ctx context.Context, loader *resolver.Loader, m *resolver.Modul
 	if m.Eff.Packaging == "pom" {
 		if goal == "install" {
 			mlog("installing pom")
-			return packager.Install(loader.Repo, m.Eff.G, m.Eff.A, m.Eff.V, "", filepath.Join(m.Dir, "pom.xml"))
+			return packager.Install(loader.Repo, m.Eff.G, m.Eff.A, m.Eff.V, "", m.POMFile)
 		}
 		return nil
 	}
@@ -474,7 +476,15 @@ func buildModule(ctx context.Context, loader *resolver.Loader, m *resolver.Modul
 						return fmt.Errorf("fetching JUnit launcher: %w", err)
 					}
 				}
-				if err := runner.RunTests(ctx, launcher, testCp, o.props["test"]); err != nil {
+				sfCfg := m.Eff.Build.SurefireConfig()
+				runCfg := runner.Config{
+					JVMArgs:        jvmArgsFromArgLine(sfCfg.ArgLine, m.Eff.Props),
+					SysProps:       sfCfg.SysProps,
+					Groups:         sfCfg.Groups,
+					ExcludedGroups: sfCfg.ExcludedGroups,
+				}
+				runCfg.Includes, runCfg.Excludes = surefirePatterns(sfCfg)
+				if err := runner.RunTestsIn(ctx, runCfg, launcher, testCp, o.props["test"]); err != nil {
 					switch {
 					case errors.Is(err, runner.ErrTestsFailed) && o.props["maven.test.failure.ignore"] == "true":
 						mlog("warning: test failures ignored (maven.test.failure.ignore=true)")
@@ -504,7 +514,7 @@ func buildModule(ctx context.Context, loader *resolver.Loader, m *resolver.Modul
 	}
 	mlog("built %s", jar)
 	if goal == "install" {
-		if err := packager.Install(loader.Repo, m.Eff.G, m.Eff.A, m.Eff.V, jar, filepath.Join(m.Dir, "pom.xml")); err != nil {
+		if err := packager.Install(loader.Repo, m.Eff.G, m.Eff.A, m.Eff.V, jar, m.POMFile); err != nil {
 			return fmt.Errorf("install: %w", err)
 		}
 		mlog("installed %s:%s:%s into %s", m.Eff.G, m.Eff.A, m.Eff.V, loader.Repo)
@@ -519,4 +529,41 @@ func hasLauncher(arts []resolver.Artifact) bool {
 		}
 	}
 	return false
+}
+
+// jvmArgsFromArgLine splits a surefire argLine into individual JVM args.
+// Unresolved ${...} and @{argLine} references (late-binding from jacoco etc.)
+// are silently dropped; those projects delegate to mvn.
+func jvmArgsFromArgLine(argLine string, props map[string]string) []string {
+	if argLine == "" {
+		return nil
+	}
+	resolved := pom.Interpolate(argLine, props)
+	var out []string
+	for _, tok := range strings.Fields(resolved) {
+		if strings.Contains(tok, "${") || strings.Contains(tok, "@{") {
+			continue
+		}
+		out = append(out, tok)
+	}
+	return out
+}
+
+// surefireDefaultIncludes are Maven Surefire's default test class patterns.
+var surefireDefaultIncludes = []string{"**/Test*.java", "**/*Test.java", "**/*Tests.java", "**/*TestCase.java"}
+
+// surefirePatterns derives include/exclude class-name regexes from the effective surefire
+// config. When no includes are configured the four Surefire defaults apply.
+func surefirePatterns(cfg pom.SurefireCfg) (includes, excludes []string) {
+	globs := cfg.Includes
+	if len(globs) == 0 {
+		globs = surefireDefaultIncludes
+	}
+	for _, g := range globs {
+		includes = append(includes, runner.AntGlobToClassRegex(g))
+	}
+	for _, g := range cfg.Excludes {
+		excludes = append(excludes, runner.AntGlobToClassRegex(g))
+	}
+	return
 }

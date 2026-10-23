@@ -69,7 +69,7 @@ func Jar(classesDir, outFile string, attrs [][2]string) error {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() || d.Name() == ".jv-stamp" {
+		if d.IsDir() || d.Name() == ".jv-stamp" || d.Name() == ".jv-resources" {
 			return nil
 		}
 		rel, _ := filepath.Rel(classesDir, p)
