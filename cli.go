@@ -14,13 +14,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jv-build/jv/bridge"
-	"github.com/jv-build/jv/compiler"
-	"github.com/jv-build/jv/config"
-	"github.com/jv-build/jv/packager"
-	"github.com/jv-build/jv/pom"
-	"github.com/jv-build/jv/resolver"
-	"github.com/jv-build/jv/runner"
+	"github.com/mxreal64/jv/bridge"
+	"github.com/mxreal64/jv/compiler"
+	"github.com/mxreal64/jv/config"
+	"github.com/mxreal64/jv/packager"
+	"github.com/mxreal64/jv/pom"
+	"github.com/mxreal64/jv/resolver"
+	"github.com/mxreal64/jv/runner"
 )
 
 var (

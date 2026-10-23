@@ -12,7 +12,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/jv-build/jv/pom"
+	"github.com/mxreal64/jv/pom"
 )
 
 // Effective is a POM after inheritance, interpolation, dependencyManagement and BOM imports.

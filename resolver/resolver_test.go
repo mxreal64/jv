@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jv-build/jv/pom"
+	"github.com/mxreal64/jv/pom"
 )
 
 func TestCompareVersions(t *testing.T) {

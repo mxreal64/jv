@@ -13,7 +13,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/jv-build/jv/pom"
+	"github.com/mxreal64/jv/pom"
 )
 
 // Node is one resolved dependency in the (nearest-wins) tree.

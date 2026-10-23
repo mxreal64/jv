@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jv-build/jv/config"
-	"github.com/jv-build/jv/pom"
+	"github.com/mxreal64/jv/config"
+	"github.com/mxreal64/jv/pom"
 )
 
 // fakeRepo maps "group:artifact:version" to the inner XML of that POM's <dependencies>.

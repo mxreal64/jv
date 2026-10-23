@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/jv-build/jv/pom"
+	"github.com/mxreal64/jv/pom"
 )
 
 // Module is one project in the reactor (a single project is a reactor of one).

@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/jv-build/jv/jdk"
+	"github.com/mxreal64/jv/jdk"
 )
 
 // Env describes the context profile activation is evaluated in.

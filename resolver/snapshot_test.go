@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/jv-build/jv/config"
+	"github.com/mxreal64/jv/config"
 )
 
 func snapshotMeta(stamp string) string {

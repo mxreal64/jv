@@ -7,7 +7,7 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/jv-build/jv/pom"
+	"github.com/mxreal64/jv/pom"
 )
 
 func matchesAny(t *testing.T, res []string, name string) bool {

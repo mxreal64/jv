@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/jv-build/jv/bridge"
+	"github.com/mxreal64/jv/bridge"
 )
 
 func TestParseArgs(t *testing.T) {

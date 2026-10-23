@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jv-build/jv/gradle"
+	"github.com/mxreal64/jv/gradle"
 )
 
 func TestGradleExtraArgs(t *testing.T) {

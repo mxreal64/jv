@@ -19,8 +19,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jv-build/jv/config"
-	"github.com/jv-build/jv/pom"
+	"github.com/mxreal64/jv/config"
+	"github.com/mxreal64/jv/pom"
 )
 
 var (
