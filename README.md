@@ -1,8 +1,113 @@
-# jv
+<h1 align="center">jv</h1>
 
-A fast, drop-in build tool that sits beside Maven and Gradle. One static Go binary; dependency
-resolution without a JVM; it shares `~/.m2` with Maven. Whatever jv cannot reproduce faithfully it
-hands to the real `mvn` or `gradle` unchanged, so adopting it never blocks a build.
+<p align="center">
+  <b>Maven and Gradle builds, minus the wait.</b><br>
+  One small static binary that resolves, compiles, tests and packages your project &mdash;<br>
+  and hands anything it can't reproduce exactly back to the real tool.
+</p>
+
+<p align="center">
+  <a href="https://github.com/mxreal64/jv/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/mxreal64/jv/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/mxreal64/jv/releases"><img alt="Release" src="https://img.shields.io/github/v/release/mxreal64/jv?include_prereleases&sort=semver"></a>
+  <a href="LICENSE"><img alt="License: GPL-3.0-only" src="https://img.shields.io/badge/license-GPL--3.0--only-blue.svg"></a>
+  <img alt="Go 1.22+" src="https://img.shields.io/badge/go-1.22%2B-00ADD8.svg">
+</p>
+
+```console
+$ cd my-project            # any Maven or Gradle project, untouched
+$ jv test                  # resolve, compile, run your JUnit tests
+$ jv package               # target/my-project-1.0.jar
+```
+
+## Why jv
+
+- **Drop-in.** It reads the `pom.xml` or Gradle build you already have. No config, no migration, no
+  lock-in: delete `jv` and nothing about your project has changed. It shares `~/.m2` with Maven.
+- **Never silently different.** When a build uses something jv can't reproduce exactly (shade,
+  resource filtering, plugin executions, Kotlin, ...), jv tells you why and runs the real `mvn` or
+  `gradle` instead. You get the same result, just not the speed-up.
+- **Checked against Maven.** The test suite diffs jv's compile, runtime and test classpaths with
+  `mvn dependency:build-classpath` on real dependency graphs (Spring Boot, Maven core, Jackson,
+  HttpClient, Log4j, and more).
+- **Fast where it counts.** Parallel, checksum-verified downloads, a cached resolution, `javac` skipped
+  when nothing changed, no JVM needed to resolve dependencies. For Gradle it asks Gradle once for a
+  model and then doesn't start it again until your build scripts change.
+- **One static binary.** Linux, macOS and Windows on amd64 and arm64. The only thing it needs is a JDK.
+- **Free software.** GPL-3.0.
+
+## Install
+
+**Download a release.** Grab the archive for your platform from the
+[Releases page](https://github.com/mxreal64/jv/releases), extract it, and put `jv` on your `PATH`
+(Windows: unzip and add the folder to `PATH`). Every release includes `checksums.txt`:
+
+```sh
+sha256sum -c checksums.txt --ignore-missing      # Linux
+shasum -a 256 jv_*_darwin_*.tar.gz               # macOS: compare the hash with checksums.txt
+```
+
+**Or build from source** (Go 1.22+):
+
+```sh
+go install github.com/mxreal64/jv@latest
+```
+
+You need a JDK (`JAVA_HOME` or `PATH`). Maven or Gradle only has to be installed for the builds jv
+delegates to them. Check it worked with `jv --version`.
+
+## Try it
+
+```sh
+jv test              # resolve, compile and run the JUnit tests
+jv package           # test, then build target/<artifactId>-<version>.jar
+jv install           # ...and install it into ~/.m2
+jv classpath test    # print the test classpath (IDEs, scripts, debugging)
+jv tree              # the resolved dependency tree
+jv -pl app test      # one module of a multi-module build, plus the siblings it needs
+jv clean install     # goals run in the order you type them
+jv -X test           # also say whether the build ran natively or was delegated
+```
+
+Want it for every build? `alias mvn=jv` in your shell: anything jv doesn't handle goes to the real
+`mvn`. (Use an alias, not a symlink.)
+
+## How it decides
+
+```
+jv <goal>
+ |
+ |-- pom.xml ----------> can jv reproduce this build exactly?
+ |                         |-- yes --> native: resolve -> javac -> JUnit -> jar
+ |                         '-- no  --> "delegating to mvn because ..."   (your build, unchanged)
+ |
+ '-- build.gradle[.kts] -> ask Gradle once for a model (cached in .jv/)
+                           |-- reproducible --> the same native steps
+                           '-- otherwise    --> Gradle itself, arguments translated
+```
+
+jv prefers a loud hand-off to a quiet difference. See *Maven projects* and *Gradle projects* below for
+exactly what runs natively and what is delegated.
+
+## FAQ
+
+**Is this a Maven or Gradle replacement?** No, it's a companion. It speeds up the everyday loop
+(resolve, compile, test, package, install) and leaves everything else (plugins, releases, site
+generation, code generation) to the real tool.
+
+**Will it produce a different result than Maven?** It is built not to. Classpaths are compared with
+Maven's in the test suite, jars are reproducible, and anything unfamiliar is delegated. If you ever
+see a difference, that's a bug: please open an issue.
+
+**What about plugins?** Plugin goals and builds that depend on plugin executions run through the
+real tool. The compiler and Surefire configuration jv understands is honoured natively.
+
+**Does it work on Windows?** Yes. The release includes Windows binaries and CI runs the test suite on
+Windows, macOS and Linux.
+
+**How mature is it?** It is pre-1.0. The core paths are well covered by tests, and the known gaps are
+listed under *Known limitations*. Try it on a branch before you rely on it in CI.
+
+## Usage reference
 
 ```
 jv compile | test | package | install | clean
@@ -150,8 +255,15 @@ real definition of "correct" for this tool: run it over more projects before eac
 (`--corpus-file FILE` takes `name|git url|ref|subdir|cp|build` lines).
 
 ## Build and release
-`make build` (Go 1.22+, `CGO_ENABLED=0` so the binary is static). Releases: tag `vX.Y.Z`; CI publishes
-binaries, the license and checksums via GoReleaser.
+`make build` (Go 1.22+, `CGO_ENABLED=0` so the binary is static) or
+`go install github.com/mxreal64/jv@latest`. Releases: tag `vX.Y.Z` (use `vX.Y.Z-rc1` to rehearse); CI
+runs the tests and then GoReleaser publishes the binaries, the license and checksums.
+
+## Contributing
+Bug reports and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Run
+`./test-all.sh --quick` before sending a change (gofmt, vet, unit tests, cross-compiles), and
+`./test-all.sh` for anything that affects resolution or builds. Report security problems privately
+(see [SECURITY.md](SECURITY.md)).
 
 ## License
 jv is free software, licensed under the **GNU General Public License, version 3 only**
