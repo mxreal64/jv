@@ -269,7 +269,3 @@ Bug reports and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md
 jv is free software, licensed under the **GNU General Public License, version 3 only**
 (SPDX: `GPL-3.0-only`); see [LICENSE](LICENSE). Copyright (C) 2026 jv contributors. Every source file
 carries an SPDX header, which CI checks. Contributions are accepted under the same license.
-
-Earlier revisions of this repository were published under the MIT License; copies obtained under it
-stay available under it. jv runs `mvn`, `gradle`, `java` and `javac` as separate programs and downloads
-the JUnit console launcher at runtime; none of them is linked into or shipped with jv.
