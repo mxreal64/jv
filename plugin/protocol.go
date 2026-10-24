@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"runtime"
+	"strings"
 	"time"
 
 	"github.com/mxreal64/jv/lifecycle"
@@ -85,7 +87,12 @@ func RunPlugin(ctx context.Context, binary string, req Request) (Response, error
 	ctxTimeout, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctxTimeout, binary)
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" && (strings.HasSuffix(strings.ToLower(binary), ".bat") || strings.HasSuffix(strings.ToLower(binary), ".cmd")) {
+		cmd = exec.CommandContext(ctxTimeout, "cmd.exe", "/c", binary)
+	} else {
+		cmd = exec.CommandContext(ctxTimeout, binary)
+	}
 	var stdin bytes.Buffer
 	if err := json.NewEncoder(&stdin).Encode(req); err != nil {
 		return Response{}, fmt.Errorf("encoding request: %w", err)

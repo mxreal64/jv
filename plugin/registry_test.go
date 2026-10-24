@@ -23,6 +23,7 @@ func TestRegistry_Resolve(t *testing.T) {
 	// 2. Present in cache
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 
 	cd := cacheDir("my.group:my-art", "2.0.0")
 	if err := os.MkdirAll(cd, 0o755); err != nil {

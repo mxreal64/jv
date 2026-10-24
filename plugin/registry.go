@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/mxreal64/jv/resolver"
 )
@@ -22,7 +23,8 @@ type PluginDescriptor struct {
 
 func cacheDir(id, version string) string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".jv", "plugins", id, version)
+	cleanID := strings.ReplaceAll(id, ":", string(filepath.Separator))
+	return filepath.Join(home, ".jv", "plugins", cleanID, version)
 }
 
 // Resolve finds or downloads the plugin binary for the current platform.

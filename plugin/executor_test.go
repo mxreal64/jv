@@ -7,6 +7,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/mxreal64/jv/lifecycle"
@@ -17,12 +18,18 @@ func TestPluginExecutor_Run(t *testing.T) {
 	targetDir := filepath.Join(dir, "target")
 	_ = os.MkdirAll(targetDir, 0o755)
 
-	script := filepath.Join(dir, "myplugin.sh")
-	scriptContent := `#!/bin/sh
-cat > /dev/null
-echo '{"message":"ok","sourceRoots":["src/gen"],"properties":{"my.prop":"value123"}}'
-exit 0
-`
+	ext := ".sh"
+	if runtime.GOOS == "windows" {
+		ext = ".bat"
+	}
+
+	script := filepath.Join(dir, "myplugin"+ext)
+	var scriptContent string
+	if runtime.GOOS == "windows" {
+		scriptContent = "@echo off\r\necho {\"message\":\"ok\",\"sourceRoots\":[\"src/gen\"],\"properties\":{\"my.prop\":\"value123\"}}\r\nexit /b 0\r\n"
+	} else {
+		scriptContent = "#!/bin/sh\ncat > /dev/null\necho '{\"message\":\"ok\",\"sourceRoots\":[\"src/gen\"],\"properties\":{\"my.prop\":\"value123\"}}'\nexit 0\n"
+	}
 	if err := os.WriteFile(script, []byte(scriptContent), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -89,8 +96,14 @@ exit 0
 	}
 
 	// Test failing plugin
-	failScript := filepath.Join(dir, "fail.sh")
-	if err := os.WriteFile(failScript, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+	failScript := filepath.Join(dir, "fail"+ext)
+	var failContent string
+	if runtime.GOOS == "windows" {
+		failContent = "@echo off\r\nexit /b 1\r\n"
+	} else {
+		failContent = "#!/bin/sh\nexit 1\n"
+	}
+	if err := os.WriteFile(failScript, []byte(failContent), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	failDesc := &PluginDescriptor{ID: "f", Binary: failScript}
@@ -100,8 +113,14 @@ exit 0
 	}
 
 	// Test skipping plugin
-	skipScript := filepath.Join(dir, "skip.sh")
-	if err := os.WriteFile(skipScript, []byte("#!/bin/sh\nexit 2\n"), 0o755); err != nil {
+	skipScript := filepath.Join(dir, "skip"+ext)
+	var skipContent string
+	if runtime.GOOS == "windows" {
+		skipContent = "@echo off\r\nexit /b 2\r\n"
+	} else {
+		skipContent = "#!/bin/sh\nexit 2\n"
+	}
+	if err := os.WriteFile(skipScript, []byte(skipContent), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	skipDesc := &PluginDescriptor{ID: "s", Binary: skipScript}
