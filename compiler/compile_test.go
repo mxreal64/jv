@@ -5,6 +5,7 @@ package compiler
 
 import (
 	"archive/zip"
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -78,5 +79,42 @@ func TestHasProcessors(t *testing.T) {
 	}
 	if !hasProcessors([]string{plain, proc}) {
 		t.Errorf("jar with a Processor service file should be detected")
+	}
+}
+
+func TestCompile_WorkerIntegration(t *testing.T) {
+	t.Setenv("JV_JAVAC_WORKER", "1")
+	defer ShutdownWorker()
+
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	outDir := filepath.Join(dir, "out")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srcFile := filepath.Join(srcDir, "App.java")
+	if err := os.WriteFile(srcFile, []byte("public class App { public static void main(String[] args){} }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ran, err := Compile(context.Background(), srcDir, outDir, nil, Options{Encoding: "UTF-8"})
+	if err != nil {
+		t.Fatalf("Compile with worker failed: %v", err)
+	}
+	if !ran {
+		t.Fatalf("expected javac to run on initial compile")
+	}
+
+	if _, err := os.Stat(filepath.Join(outDir, "App.class")); err != nil {
+		t.Fatalf("expected App.class to be produced: %v", err)
+	}
+
+	// Second run should be cached / skipped
+	ranAgain, err := Compile(context.Background(), srcDir, outDir, nil, Options{Encoding: "UTF-8"})
+	if err != nil {
+		t.Fatalf("second Compile failed: %v", err)
+	}
+	if ranAgain {
+		t.Fatalf("expected second Compile to be skipped due to stamp match")
 	}
 }

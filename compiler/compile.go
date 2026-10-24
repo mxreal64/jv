@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/mxreal64/jv/compiler/worker"
 )
 
 // Options are the javac settings jv honours. Args are extra javac arguments (for example
@@ -158,12 +160,55 @@ func Compile(ctx context.Context, srcDir, outDir string, classpath []string, opt
 		args = append(args, "-proc:full")
 	}
 	args = append(args, "@"+argFile)
+
+	if os.Getenv("JV_JAVAC_WORKER") == "1" {
+		var workerArgs []string
+		for _, a := range args {
+			if !strings.HasPrefix(a, "-J") {
+				workerArgs = append(workerArgs, a)
+			}
+		}
+		w := getWorker(ctx)
+		if w != nil {
+			if err := w.Compile(ctx, workerArgs, ""); err != nil {
+				return false, err
+			}
+			return true, os.WriteFile(stamp, []byte(sig), 0o644)
+		}
+	}
+
 	cmd := exec.CommandContext(ctx, javacBinary(), args...)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
 		return false, err
 	}
 	return true, os.WriteFile(stamp, []byte(sig), 0o644)
+}
+
+var (
+	defaultWorkerMu   sync.Mutex
+	defaultWorkerOnce sync.Once
+	defaultWorker     *worker.Worker
+)
+
+func getWorker(ctx context.Context) *worker.Worker {
+	defaultWorkerOnce.Do(func() {
+		w, err := worker.Start(ctx, os.Getenv("JAVA_HOME"))
+		if err == nil {
+			defaultWorker = w
+		}
+	})
+	return defaultWorker
+}
+
+// ShutdownWorker terminates any active background javac worker daemon.
+func ShutdownWorker() {
+	defaultWorkerMu.Lock()
+	defer defaultWorkerMu.Unlock()
+	if defaultWorker != nil {
+		defaultWorker.Stop()
+		defaultWorker = nil
+	}
 }
 
 // pruneEmptyDirs removes empty subdirectories of root (deepest first).
