@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 jv contributors
+// Copyright mxreal64, 2026
 
 package resolver
 
@@ -342,7 +342,9 @@ func (l *Loader) finalize(r *raw, chain []string) (*Effective, error) {
 			if d.Optional == "" {
 				d.Optional = m.Optional
 			}
-			d.Exclusions = unionExcl(d.Exclusions, m.Exclusions)
+			if len(d.Exclusions) == 0 {
+				d.Exclusions = append([]pom.Exclusion{}, m.Exclusions...)
+			}
 		}
 		if d.Scope == "" {
 			d.Scope = "compile"

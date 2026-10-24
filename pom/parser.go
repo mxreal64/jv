@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 jv contributors
+// Copyright mxreal64, 2026
 
 package pom
 
@@ -114,6 +114,7 @@ type PluginExecution struct {
 
 type PluginConfigChild struct {
 	XMLName xml.Name
+	Value   string `xml:",chardata"`
 }
 
 // PluginConfig holds plugin <configuration> that jv acts on.
@@ -132,6 +133,15 @@ type PluginConfig struct {
 	ArgLine            string              `xml:"argLine"`
 	SystemPropertyVars Properties          `xml:"systemPropertyVariables"`
 	Other              []PluginConfigChild `xml:",any"`
+}
+
+func (c PluginConfig) GetOther(name string) string {
+	for _, o := range c.Other {
+		if o.XMLName.Local == name {
+			return strings.TrimSpace(o.Value)
+		}
+	}
+	return ""
 }
 
 type Plugin struct {
@@ -189,6 +199,9 @@ func (b Build) effectivePlugins() []Plugin {
 	}
 	return out
 }
+
+// EffectivePlugins returns the merged plugin list (exported for use by the lifecycle package).
+func (b Build) EffectivePlugins() []Plugin { return b.effectivePlugins() }
 
 func pluginConfigEmpty(c PluginConfig) bool {
 	return c.Release == "" && c.Source == "" && c.Target == "" && c.Encoding == "" &&

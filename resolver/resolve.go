@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 jv contributors
+// Copyright mxreal64, 2026
 
 package resolver
 
@@ -201,7 +201,9 @@ func (l *Loader) Resolve(root *Effective) ([]*Node, error) {
 					if m.Scope != "" {
 						cd.Scope = m.Scope
 					}
-					cd.Exclusions = unionExcl(cd.Exclusions, m.Exclusions)
+					if len(cd.Exclusions) == 0 {
+						cd.Exclusions = append([]pom.Exclusion{}, m.Exclusions...)
+					}
 				}
 				if cs := derive(n.Scope, cd.Scope); cs != "" {
 					level = append(level, cand{dep: cd, scope: cs, raw: cd.Scope, excl: n.excl, parent: n})

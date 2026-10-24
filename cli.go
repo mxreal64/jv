@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 jv contributors
+// Copyright mxreal64, 2026
 
 package main
 
@@ -10,21 +10,30 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/mxreal64/jv/bridge"
 	"github.com/mxreal64/jv/compiler"
 	"github.com/mxreal64/jv/config"
+	"github.com/mxreal64/jv/lifecycle"
 	"github.com/mxreal64/jv/packager"
+	"github.com/mxreal64/jv/plugins/codegen"
+	"github.com/mxreal64/jv/plugins/enforcer"
+	"github.com/mxreal64/jv/plugins/flatten"
+	"github.com/mxreal64/jv/plugins/jacoco"
+	"github.com/mxreal64/jv/plugins/shade"
+	"github.com/mxreal64/jv/plugins/springboot"
 	"github.com/mxreal64/jv/pom"
 	"github.com/mxreal64/jv/resolver"
 	"github.com/mxreal64/jv/runner"
 )
 
 var (
-	version = "dev"
+	version = "v0.2.0-rc1"
 	quiet   bool
 )
 
@@ -175,7 +184,7 @@ func run(args []string) int {
 	quiet = o.quiet
 	if o.version {
 		fmt.Println("jv " + version)
-		fmt.Println("Copyright (C) 2026 jv contributors")
+		fmt.Println("Copyright mxreal64, 2026")
 		fmt.Println("License GPLv3: GNU GPL version 3 <https://www.gnu.org/licenses/gpl-3.0.html>.")
 		fmt.Println("This is free software: you are free to change and redistribute it.")
 		fmt.Println("There is NO WARRANTY, to the extent permitted by law.")
@@ -242,6 +251,7 @@ func run(args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	defer compiler.ShutdownWorker()
 	start := time.Now()
 
 	settings, err := config.LoadSettings(o.settingsFile)
@@ -281,7 +291,7 @@ func run(args []string) int {
 	}
 
 	loader := resolver.NewLoader(ctx, settings.RepoDir(), settings)
-	loader.Offline, loader.Verbose, loader.ProfileIDs, loader.UserProps = o.offline, o.verbose, o.profiles, o.props
+	loader.Offline, loader.Verbose, loader.Quiet, loader.ProfileIDs, loader.UserProps = o.offline, o.verbose, o.quiet, o.profiles, o.props
 	loader.UpdateSnapshots = o.updateSnapshots
 	loader.AddSettingsRepos(settings.ActiveRepos(o.profiles))
 	mods, err := loader.Discover(root)
@@ -360,14 +370,108 @@ func run(args []string) int {
 				return 1
 			}
 		}
-		for _, m := range targets {
-			if err := buildModule(ctx, loader, m, goal, o, len(targets) > 1); err != nil {
+		if len(targets) > 1 && (goal == "compile" || goal == "test-compile") {
+			byGAV := make(map[string]*resolver.Module, len(targets))
+			byGA := make(map[string]*resolver.Module, len(targets))
+			for _, m := range targets {
+				byGAV[m.GAV()] = m
+				byGA[m.Eff.G+":"+m.Eff.A] = m
+			}
+			dependents := make(map[*resolver.Module][]*resolver.Module, len(targets))
+			inDegree := make(map[*resolver.Module]int, len(targets))
+			for _, m := range targets {
+				depsSeen := make(map[*resolver.Module]bool)
+				if m.Eff != nil {
+					for _, d := range m.Eff.Deps {
+						var depMod *resolver.Module
+						if dm := byGAV[d.GroupID+":"+d.ArtifactID+":"+d.Version]; dm != nil && dm != m {
+							depMod = dm
+						} else if dm := byGA[d.GroupID+":"+d.ArtifactID]; dm != nil && dm != m {
+							depMod = dm
+						}
+						if depMod != nil && !depsSeen[depMod] {
+							depsSeen[depMod] = true
+							dependents[depMod] = append(dependents[depMod], m)
+							inDegree[m]++
+						}
+					}
+				}
+			}
+			workers := len(targets)
+			if n := runtime.NumCPU(); workers > n {
+				workers = n
+			}
+			if workers < 1 {
+				workers = 1
+			}
+			ready := make(chan *resolver.Module, len(targets))
+			for _, m := range targets {
+				if inDegree[m] == 0 {
+					ready <- m
+				}
+			}
+			var mu sync.Mutex
+			var firstErr error
+			completed := 0
+			var wg sync.WaitGroup
+			wg.Add(workers)
+			rctx, rcancel := context.WithCancel(ctx)
+			defer rcancel()
+			for i := 0; i < workers; i++ {
+				go func() {
+					defer wg.Done()
+					for {
+						select {
+						case <-rctx.Done():
+							return
+						case m, ok := <-ready:
+							if !ok {
+								return
+							}
+							err := buildModule(rctx, loader, m, goal, o, true)
+							mu.Lock()
+							if err != nil {
+								if firstErr == nil {
+									firstErr = err
+									rcancel()
+								}
+								mu.Unlock()
+								return
+							}
+							completed++
+							for _, dep := range dependents[m] {
+								inDegree[dep]--
+								if inDegree[dep] == 0 {
+									ready <- dep
+								}
+							}
+							if completed == len(targets) {
+								close(ready)
+							}
+							mu.Unlock()
+						}
+					}
+				}()
+			}
+			wg.Wait()
+			if firstErr != nil {
 				if ctx.Err() != nil {
 					errf("interrupted")
 				} else {
-					errf("%s: %v", m.Eff.A, err)
+					errf("%v", firstErr)
 				}
 				return 1
+			}
+		} else {
+			for _, m := range targets {
+				if err := buildModule(ctx, loader, m, goal, o, len(targets) > 1); err != nil {
+					if ctx.Err() != nil {
+						errf("interrupted")
+					} else {
+						errf("%s: %v", m.Eff.A, err)
+					}
+					return 1
+				}
 			}
 		}
 	}
@@ -403,6 +507,312 @@ func resolveModule(loader *resolver.Loader, m *resolver.Module, forTree bool, ml
 	return arts, nil, nil
 }
 
+// makeBuildContext constructs a BuildContext from a resolved module and its artifacts.
+func makeBuildContext(m *resolver.Module, arts []resolver.Artifact, loader *resolver.Loader, effProps map[string]string) lifecycle.BuildContext {
+	// Build PluginConfigs map from the effective build.
+	pluginConfigs := map[string]pom.PluginConfig{}
+	for _, p := range m.Eff.Build.EffectivePlugins() {
+		pluginConfigs[p.ArtifactID] = p.Configuration
+	}
+	filtering := false
+	for _, r := range m.Eff.Build.Resources {
+		if strings.TrimSpace(r.Filtering) == "true" {
+			filtering = true
+			break
+		}
+	}
+	testFiltering := false
+	for _, r := range m.Eff.Build.TestResources {
+		if strings.TrimSpace(r.Filtering) == "true" {
+			testFiltering = true
+			break
+		}
+	}
+
+	return lifecycle.BuildContext{
+		Group:                 m.Eff.G,
+		Artifact:              m.Eff.A,
+		Version:               m.Eff.V,
+		Packaging:             m.Eff.Packaging,
+		Dir:                   m.Dir,
+		SourceDirs:            []string{"src/main/java"},
+		TestSourceDirs:        []string{"src/test/java"},
+		ResourceDirs:          []string{"src/main/resources"},
+		TestResourceDirs:      []string{"src/test/resources"},
+		ResourceFiltering:     filtering,
+		TestResourceFiltering: testFiltering,
+		ClassesDir:            "target/classes",
+		TestClassesDir:        "target/test-classes",
+		GeneratedDir:          "target/generated-sources/annotations",
+		TargetDir:             "target",
+		CompileCP:             resolver.Classpath(arts, "compile"),
+		TestCP:                resolver.Classpath(arts, "test"),
+		RuntimeCP:             resolver.Classpath(arts, "runtime"),
+		Props:                 effProps,
+		PluginConfigs:         pluginConfigs,
+		Repo:                  loader.Repo,
+	}
+}
+
+// buildLifecycle constructs the default Maven lifecycle for a jar/war module.
+func buildLifecycle(
+	ctx context.Context,
+	loader *resolver.Loader,
+	m *resolver.Module,
+	arts []resolver.Artifact,
+	o *cliOpts,
+	mlog func(string, ...any),
+) *lifecycle.Lifecycle {
+	lc := lifecycle.New()
+
+	// validate
+	lc.Add(lifecycle.FuncExecutor{PhaseVal: "validate", IDVal: "enforcer", Fn: func(ctx context.Context, bc lifecycle.BuildContext) error {
+		if _, ok := bc.PluginConfigs["maven-enforcer-plugin"]; ok {
+			if err := enforcer.RunEnforcer(bc, arts, bc.Props["java.version"]); err != nil {
+				return fmt.Errorf("enforcer error: %w", err)
+			}
+			mlog("validated enforcer rules")
+		}
+		return nil
+	}})
+
+	// initialize
+	lc.Add(lifecycle.FuncExecutor{PhaseVal: "initialize", IDVal: "jacoco-prepare", Fn: func(ctx context.Context, bc lifecycle.BuildContext) error {
+		if _, ok := bc.PluginConfigs["jacoco-maven-plugin"]; ok {
+			if err := jacoco.PrepareAgent(&bc); err != nil {
+				return fmt.Errorf("jacoco prepare: %w", err)
+			}
+			mlog("prepared jacoco javaagent")
+		}
+		return nil
+	}})
+
+	// generate-sources
+	lc.Add(lifecycle.FuncExecutor{PhaseVal: "generate-sources", IDVal: "codegen", Fn: func(ctx context.Context, bc lifecycle.BuildContext) error {
+		// Auto-detect protobuf / antlr4
+		if _, ok := bc.PluginConfigs["protobuf-maven-plugin"]; ok {
+			g := codegen.Generator{
+				ID:        "protobuf",
+				Phase:     "generate-sources",
+				Command:   []string{"protoc", "--java_out=" + filepath.Join(bc.TargetDir, "generated-sources", "protobuf"), "src/main/proto/*.proto"},
+				OutputDir: filepath.Join(bc.TargetDir, "generated-sources", "protobuf"),
+				Inputs:    []string{"src/main/proto/**/*.proto"},
+			}
+			_ = codegen.Run(ctx, g, &bc)
+		}
+		return nil
+	}})
+
+	// process-resources
+	lc.Add(lifecycle.FuncExecutor{PhaseVal: "process-resources", IDVal: "resources", Fn: func(ctx context.Context, bc lifecycle.BuildContext) error {
+		for _, r := range bc.ResourceDirs {
+			if err := compiler.CopyResources(ctx, r, bc.ClassesDir, bc.ResourceFiltering, bc.Props, nil); err != nil {
+				return fmt.Errorf("copying resources: %w", err)
+			}
+		}
+
+		// task 1.2: flatten-maven-plugin check
+		cfg, hasFlatten := bc.PluginConfigs["flatten-maven-plugin"]
+		if !hasFlatten {
+			cfg, hasFlatten = bc.PluginConfigs["maven-flatten-plugin"]
+		}
+		if hasFlatten {
+			modeStr := cfg.GetOther("flattenMode")
+			flattenMode := flatten.FlattenMode(modeStr)
+			if flattenMode == "" {
+				flattenMode = flatten.ModeResolveCiFriendlyVersions
+			}
+			outFlatten := filepath.Join(bc.Dir, ".flattened-pom.xml")
+			if err := flatten.Flatten(m.POMFile, bc.Props, flattenMode, outFlatten); err != nil {
+				return fmt.Errorf("flatten pom: %w", err)
+			}
+			mlog("generated .flattened-pom.xml")
+		}
+
+		return nil
+	}})
+
+	// compile
+	lc.Add(lifecycle.FuncExecutor{PhaseVal: "compile", IDVal: "compile", Fn: func(ctx context.Context, bc lifecycle.BuildContext) error {
+		opts := compiler.OptionsFrom(bc.Props)
+		var src string
+		if dirs := bc.AllSourceDirs(); len(dirs) > 0 {
+			src = dirs[0]
+		}
+		compiled, err := compiler.Compile(ctx, src, bc.ClassesDir, bc.CompileCP, opts)
+		if err != nil {
+			return fmt.Errorf("compilation failed: %w", err)
+		}
+		if compiled {
+			mlog("compiled main sources")
+		} else {
+			mlog("main classes up to date")
+		}
+		return nil
+	}})
+
+	// process-test-resources
+	lc.Add(lifecycle.FuncExecutor{PhaseVal: "process-test-resources", IDVal: "test-resources", Fn: func(ctx context.Context, bc lifecycle.BuildContext) error {
+		if o.skipTestCompilation {
+			return nil
+		}
+		for _, r := range bc.TestResourceDirs {
+			if err := compiler.CopyResources(ctx, r, bc.TestClassesDir, bc.TestResourceFiltering, bc.Props, nil); err != nil {
+				return fmt.Errorf("copying test resources: %w", err)
+			}
+		}
+		return nil
+	}})
+
+	// test-compile
+	lc.Add(lifecycle.FuncExecutor{PhaseVal: "test-compile", IDVal: "test-compile", Fn: func(ctx context.Context, bc lifecycle.BuildContext) error {
+		if o.skipTestCompilation {
+			return nil
+		}
+		opts := compiler.OptionsFrom(bc.Props)
+		var testSrc string
+		if dirs := bc.AllTestSourceDirs(); len(dirs) > 0 {
+			testSrc = dirs[0]
+		}
+		testCp := append([]string{bc.TestClassesDir, bc.ClassesDir}, bc.TestCP...)
+		tc, err := compiler.Compile(ctx, testSrc, bc.TestClassesDir, testCp, opts)
+		if err != nil {
+			return fmt.Errorf("test compilation failed: %w", err)
+		}
+		if tc {
+			mlog("compiled test sources")
+		}
+		return nil
+	}})
+
+	// test
+	lc.Add(lifecycle.FuncExecutor{PhaseVal: "test", IDVal: "test", Fn: func(ctx context.Context, bc lifecycle.BuildContext) error {
+		if o.skipTestCompilation || o.skipTests {
+			return nil
+		}
+		if st, err := os.Stat(bc.TestClassesDir); err != nil || !st.IsDir() {
+			return nil
+		}
+		testCp := append([]string{bc.TestClassesDir, bc.ClassesDir}, bc.TestCP...)
+		launcher := ""
+		if !hasLauncher(arts) {
+			ver := os.Getenv("JV_JUNIT_VERSION")
+			if ver == "" {
+				ver = defaultJUnit
+			}
+			var err error
+			if launcher, err = loader.FetchJar("org.junit.platform", "junit-platform-console-standalone", ver); err != nil {
+				return fmt.Errorf("fetching JUnit launcher: %w", err)
+			}
+		}
+		sfCfg := m.Eff.Build.SurefireConfig()
+		runCfg := runner.Config{
+			JVMArgs:        jvmArgsFromArgLine(sfCfg.ArgLine, bc.Props),
+			SysProps:       sfCfg.SysProps,
+			Groups:         sfCfg.Groups,
+			ExcludedGroups: sfCfg.ExcludedGroups,
+		}
+		runCfg.Includes, runCfg.Excludes = surefirePatterns(sfCfg)
+		if err := runner.RunTestsIn(ctx, runCfg, launcher, testCp, o.props["test"]); err != nil {
+			switch {
+			case errors.Is(err, runner.ErrTestsFailed) && o.props["maven.test.failure.ignore"] == "true":
+				mlog("warning: test failures ignored (maven.test.failure.ignore=true)")
+			case errors.Is(err, runner.ErrTestsFailed):
+				return err
+			default:
+				return fmt.Errorf("running tests: %w", err)
+			}
+		}
+		return nil
+	}})
+
+	// package (jar)
+	lc.Add(lifecycle.FuncExecutor{PhaseVal: "package", IDVal: "jar", Fn: func(ctx context.Context, bc lifecycle.BuildContext) error {
+		jar := filepath.Join(bc.TargetDir, bc.Artifact+"-"+bc.Version+".jar")
+		var attrs [][2]string
+		for _, k := range []string{"jv.mainClass", "exec.mainClass", "mainClass"} {
+			if mc := bc.Props[k]; mc != "" {
+				attrs = append(attrs, [2]string{"Main-Class", mc})
+				break
+			}
+		}
+		if err := packager.Jar(bc.ClassesDir, jar, attrs); err != nil {
+			return fmt.Errorf("packaging: %w", err)
+		}
+		mlog("built %s", jar)
+
+		// spring-boot:repackage check
+		sbCfg, hasSB := bc.PluginConfigs["spring-boot-maven-plugin"]
+		if hasSB {
+			mainClass := sbCfg.GetOther("mainClass")
+			if mainClass == "" {
+				for _, k := range []string{"start-class", "startClass", "mainClass", "exec.mainClass", "jv.mainClass"} {
+					if mc := bc.Props[k]; mc != "" {
+						mainClass = mc
+						break
+					}
+				}
+			}
+			sbVer := bc.Props["spring-boot.version"]
+			if err := springboot.Repackage(jar, bc.RuntimeCP, mainClass, sbVer, jar); err != nil {
+				return fmt.Errorf("spring-boot repackage: %w", err)
+			}
+			mlog("repackaged %s with spring-boot-maven-plugin", jar)
+		}
+
+		// task 1.4: maven-shade-plugin:shade check
+		_, hasShade := bc.PluginConfigs["maven-shade-plugin"]
+		if hasShade {
+			var inputs []string
+			if _, err := os.Stat(jar); err == nil {
+				inputs = append(inputs, jar)
+			}
+			for _, cp := range bc.RuntimeCP {
+				if strings.HasSuffix(cp, ".jar") {
+					inputs = append(inputs, cp)
+				}
+			}
+			if err := shade.Merge(inputs, jar, nil, nil, nil); err != nil {
+				return fmt.Errorf("shading jar: %w", err)
+			}
+			mlog("shaded %s with maven-shade-plugin", jar)
+		}
+
+		return nil
+	}})
+
+	// verify
+	lc.Add(lifecycle.FuncExecutor{PhaseVal: "verify", IDVal: "jacoco-report", Fn: func(ctx context.Context, bc lifecycle.BuildContext) error {
+		if _, ok := bc.PluginConfigs["jacoco-maven-plugin"]; ok {
+			if err := jacoco.GenerateReport(ctx, bc); err != nil {
+				return fmt.Errorf("jacoco report: %w", err)
+			}
+			mlog("generated jacoco report")
+		}
+		return nil
+	}})
+
+	// install
+	lc.Add(lifecycle.FuncExecutor{PhaseVal: "install", IDVal: "install", Fn: func(ctx context.Context, bc lifecycle.BuildContext) error {
+		jar := filepath.Join(bc.TargetDir, bc.Artifact+"-"+bc.Version+".jar")
+		if _, err := os.Stat(jar); err != nil {
+			jar = "" // pom-only or no jar yet
+		}
+		pomToInstall := m.POMFile
+		flattened := filepath.Join(bc.Dir, ".flattened-pom.xml")
+		if _, err := os.Stat(flattened); err == nil {
+			pomToInstall = flattened
+		}
+		if err := packager.Install(bc.Repo, bc.Group, bc.Artifact, bc.Version, jar, pomToInstall); err != nil {
+			return fmt.Errorf("install: %w", err)
+		}
+		mlog("installed %s:%s:%s into %s", bc.Group, bc.Artifact, bc.Version, bc.Repo)
+		return nil
+	}})
+
+	return lc
+}
+
 func buildModule(ctx context.Context, loader *resolver.Loader, m *resolver.Module, goal string, o *cliOpts, multi bool) error {
 	if err := os.Chdir(m.Dir); err != nil {
 		return err
@@ -425,6 +835,7 @@ func buildModule(ctx context.Context, loader *resolver.Loader, m *resolver.Modul
 	if err != nil {
 		return err
 	}
+	// Non-lifecycle goals handled directly.
 	switch goal {
 	case "tree":
 		fmt.Printf("%s:%s:%s\n", m.Eff.G, m.Eff.A, m.Eff.V)
@@ -435,89 +846,21 @@ func buildModule(ctx context.Context, loader *resolver.Loader, m *resolver.Modul
 		return nil
 	}
 
-	opts := compiler.OptionsFrom(m.Eff.Props)
-	compiled, err := compiler.Compile(ctx, "src/main/java", "target/classes", resolver.Classpath(arts, "compile"), opts)
-	if err != nil {
-		return fmt.Errorf("compilation failed: %w", err)
+	// Build effective props: POM props + plugin-management compiler overrides.
+	effProps := make(map[string]string, len(m.Eff.Props)+4)
+	for k, v := range m.Eff.Props {
+		effProps[k] = v
 	}
-	if err := compiler.CopyResources("src/main/resources", "target/classes"); err != nil {
-		return fmt.Errorf("copying resources: %w", err)
-	}
-	if compiled {
-		mlog("compiled main sources")
-	} else {
-		mlog("main classes up to date")
-	}
-	if goal == "compile" {
-		return nil
+	for k, v := range m.Eff.Build.CompilerProps() {
+		if effProps[k] == "" {
+			effProps[k] = v
+		}
 	}
 
-	if !o.skipTestCompilation {
-		testCp := append([]string{"target/test-classes", "target/classes"}, resolver.Classpath(arts, "test")...)
-		tc, err := compiler.Compile(ctx, "src/test/java", "target/test-classes", testCp, opts)
-		if err != nil {
-			return fmt.Errorf("test compilation failed: %w", err)
-		}
-		if err := compiler.CopyResources("src/test/resources", "target/test-classes"); err != nil {
-			return fmt.Errorf("copying test resources: %w", err)
-		}
-		if tc {
-			mlog("compiled test sources")
-		}
-		if !o.skipTests {
-			if st, err := os.Stat("target/test-classes"); err == nil && st.IsDir() {
-				launcher := ""
-				if !hasLauncher(arts) {
-					ver := os.Getenv("JV_JUNIT_VERSION")
-					if ver == "" {
-						ver = defaultJUnit
-					}
-					if launcher, err = loader.FetchJar("org.junit.platform", "junit-platform-console-standalone", ver); err != nil {
-						return fmt.Errorf("fetching JUnit launcher: %w", err)
-					}
-				}
-				sfCfg := m.Eff.Build.SurefireConfig()
-				runCfg := runner.Config{
-					JVMArgs:        jvmArgsFromArgLine(sfCfg.ArgLine, m.Eff.Props),
-					SysProps:       sfCfg.SysProps,
-					Groups:         sfCfg.Groups,
-					ExcludedGroups: sfCfg.ExcludedGroups,
-				}
-				runCfg.Includes, runCfg.Excludes = surefirePatterns(sfCfg)
-				if err := runner.RunTestsIn(ctx, runCfg, launcher, testCp, o.props["test"]); err != nil {
-					switch {
-					case errors.Is(err, runner.ErrTestsFailed) && o.props["maven.test.failure.ignore"] == "true":
-						mlog("warning: test failures ignored (maven.test.failure.ignore=true)")
-					case errors.Is(err, runner.ErrTestsFailed):
-						return err
-					default:
-						return fmt.Errorf("running tests: %w", err)
-					}
-				}
-			}
-		}
-	}
-	if goal == "test" {
-		return nil
-	}
-
-	jar := filepath.Join("target", m.Eff.A+"-"+m.Eff.V+".jar")
-	var attrs [][2]string
-	for _, k := range []string{"jv.mainClass", "exec.mainClass", "mainClass"} {
-		if mc := m.Eff.Props[k]; mc != "" {
-			attrs = append(attrs, [2]string{"Main-Class", mc})
-			break
-		}
-	}
-	if err := packager.Jar("target/classes", jar, attrs); err != nil {
-		return fmt.Errorf("packaging: %w", err)
-	}
-	mlog("built %s", jar)
-	if goal == "install" {
-		if err := packager.Install(loader.Repo, m.Eff.G, m.Eff.A, m.Eff.V, jar, m.POMFile); err != nil {
-			return fmt.Errorf("install: %w", err)
-		}
-		mlog("installed %s:%s:%s into %s", m.Eff.G, m.Eff.A, m.Eff.V, loader.Repo)
+	bc := makeBuildContext(m, arts, loader, effProps)
+	lc := buildLifecycle(ctx, loader, m, arts, o, mlog)
+	if err := lc.RunUpTo(ctx, lifecycle.Phase(goal), bc); err != nil {
+		return err
 	}
 	return nil
 }

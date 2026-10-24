@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 jv contributors
+// Copyright mxreal64, 2026
 
 package resolver
 

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 jv contributors
+// Copyright mxreal64, 2026
 
 package main
 
@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -106,8 +107,12 @@ func runGradleNative(o *cliOpts, args []string, cwd, gradleCmd string) (code int
 		logf("using cached Gradle model")
 	}
 	if reasons := model.Unsupported(); len(reasons) > 0 && os.Getenv("JV_IGNORE_BUILD_CONFIG") == "" {
-		logf("this Gradle build uses features jv does not reproduce natively (%s); delegating to gradle (set JV_IGNORE_BUILD_CONFIG=1 to build natively anyway)", strings.Join(reasons, "; "))
-		return 0, false
+		if len(o.goals) == 1 && o.goals[0] == "classpath" {
+			// Serve classpath natively from the model even if the build uses unsupported plugins
+		} else {
+			logf("this Gradle build uses features jv does not reproduce natively (%s); delegating to gradle (set JV_IGNORE_BUILD_CONFIG=1 to build natively anyway)", strings.Join(reasons, "; "))
+			return 0, false
+		}
 	}
 	ordered, err := model.Order()
 	if err != nil {
@@ -150,7 +155,7 @@ func runGradleNative(o *cliOpts, args []string, cwd, gradleCmd string) (code int
 				settings = &config.Settings{}
 			}
 			loader = resolver.NewLoader(ctx, settings.RepoDir(), settings)
-			loader.Offline, loader.Verbose = o.offline, o.verbose
+			loader.Offline, loader.Verbose, loader.Quiet = o.offline, o.verbose, o.quiet
 		}
 		return loader
 	}
@@ -249,7 +254,7 @@ func buildGradleProject(ctx context.Context, mk func() *resolver.Loader, model *
 		}
 	}
 	if len(p.MainRes) == 1 && p.MainResOut != "" {
-		if err := compiler.CopyResources(p.MainRes[0], p.MainResOut); err != nil {
+		if err := compiler.CopyResources(ctx, p.MainRes[0], p.MainResOut, false, nil, nil); err != nil {
 			return fmt.Errorf("copying resources: %w", err)
 		}
 	}
@@ -265,7 +270,7 @@ func buildGradleProject(ctx context.Context, mk func() *resolver.Loader, model *
 			return fmt.Errorf("test compilation failed: %w", err)
 		}
 		if len(p.TestRes) == 1 && p.TestResOut != "" {
-			if err := compiler.CopyResources(p.TestRes[0], p.TestResOut); err != nil {
+			if err := compiler.CopyResources(ctx, p.TestRes[0], p.TestResOut, false, nil, nil); err != nil {
 				return fmt.Errorf("copying test resources: %w", err)
 			}
 		}
@@ -314,11 +319,11 @@ func buildGradleProject(ctx context.Context, mk func() *resolver.Loader, model *
 		return err
 	}
 	defer os.RemoveAll(stage)
-	if err := compiler.CopyResources(mainOut, stage); err != nil {
+	if err := copyDirContents(mainOut, stage); err != nil {
 		return err
 	}
 	if p.MainResOut != "" {
-		if err := compiler.CopyResources(p.MainResOut, stage); err != nil {
+		if err := copyDirContents(p.MainResOut, stage); err != nil {
 			return err
 		}
 	}
@@ -380,4 +385,33 @@ func safeToClean(p *gradle.Project, root string) bool {
 		}
 	}
 	return true
+}
+
+func copyDirContents(src, dst string) error {
+	if st, err := os.Stat(src); err != nil || !st.IsDir() {
+		return nil
+	}
+	return filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			rel, err := filepath.Rel(src, p)
+			if err != nil {
+				return err
+			}
+			return os.MkdirAll(filepath.Join(dst, rel), 0o755)
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		_ = os.MkdirAll(filepath.Dir(target), 0o755)
+		return os.WriteFile(target, data, 0o644)
+	})
 }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 jv contributors
+// Copyright mxreal64, 2026
 
 package resolver
 
@@ -88,6 +88,7 @@ type Loader struct {
 	Settings   *config.Settings
 	Offline    bool
 	Verbose    bool
+	Quiet      bool
 	ProfileIDs map[string]bool   // -P ids ("!id" disables)
 	UserProps  map[string]string // -D properties
 
@@ -143,6 +144,9 @@ func (l *Loader) AddSettingsRepos(rs []config.Repo) {
 }
 
 func (l *Loader) warnf(format string, a ...any) {
+	if l.Quiet {
+		return
+	}
 	fmt.Fprintf(os.Stderr, "[jv] warning: "+format+"\n", a...)
 }
 
