@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/mxreal64/jv/bridge"
+	"github.com/mxreal64/jv/cmd"
 	"github.com/mxreal64/jv/compiler"
 	"github.com/mxreal64/jv/config"
 	"github.com/mxreal64/jv/lifecycle"
@@ -82,6 +83,7 @@ var nativeGoals = map[string]bool{
 	"install":   true,
 	"classpath": true,
 	"tree":      true,
+	"lsp":       true,
 }
 
 type cliOpts struct {
@@ -211,6 +213,17 @@ func run(args []string) int {
 	}
 
 	isGradle, gradlew := bridge.DetectGradle(root)
+
+	// jv lsp — JSON-RPC classpath server; handled before project-type detection.
+	if len(o.goals) > 0 && o.goals[0] == "lsp" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := cmd.RunLSP(ctx, root, os.Stdin, os.Stdout); err != nil && err != context.Canceled {
+			errf("lsp: %v", err)
+			return 1
+		}
+		return 0
+	}
 
 	// If no pom.xml is found, but Gradle project is detected, delegate to Gradle
 	if !hasPom && isGradle {
