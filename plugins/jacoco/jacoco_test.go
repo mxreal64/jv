@@ -15,8 +15,9 @@ import (
 )
 
 func TestPrepareAgentArgLine(t *testing.T) {
+	targetDir := filepath.Join(t.TempDir(), "target")
 	bc := &lifecycle.BuildContext{
-		TargetDir: "/tmp/target",
+		TargetDir: targetDir,
 		Props:     map[string]string{},
 	}
 
@@ -24,7 +25,7 @@ func TestPrepareAgentArgLine(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expected := "-javaagent:/tmp/target/jacoco-agent.jar=destfile=/tmp/target/jacoco.exec"
+	expected := "-javaagent:" + filepath.Join(targetDir, "jacoco-agent.jar") + "=destfile=" + filepath.Join(targetDir, "jacoco.exec")
 	if bc.Props["argLine"] != expected {
 		t.Fatalf("expected argLine %q, got %q", expected, bc.Props["argLine"])
 	}

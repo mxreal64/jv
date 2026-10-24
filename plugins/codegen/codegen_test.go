@@ -12,9 +12,29 @@ import (
 	"github.com/mxreal64/jv/lifecycle"
 )
 
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	defer os.Exit(0)
+	args := os.Args
+	for len(args) > 0 {
+		if args[0] == "--" {
+			args = args[1:]
+			break
+		}
+		args = args[1:]
+	}
+	if len(args) > 0 {
+		_ = os.WriteFile(args[0], []byte("public class Generated {}\n"), 0o644)
+	}
+}
+
 func TestGeneratorRunAndIncremental(t *testing.T) {
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+
 	dir := t.TempDir()
-	outDir := filepath.Join(dir, "target/generated-sources/testgen")
+	outDir := filepath.Join(dir, "target", "generated-sources", "testgen")
 	inFile := filepath.Join(dir, "input.txt")
 	if err := os.WriteFile(inFile, []byte("hello"), 0o644); err != nil {
 		t.Fatal(err)
@@ -28,10 +48,11 @@ func TestGeneratorRunAndIncremental(t *testing.T) {
 		},
 	}
 
+	genFile := filepath.Join(outDir, "Generated.java")
 	g := Generator{
 		ID:        "testgen",
 		Phase:     "generate-sources",
-		Command:   []string{"sh", "-c", "touch " + filepath.Join(outDir, "Generated.java")},
+		Command:   []string{os.Args[0], "-test.run=TestHelperProcess", "--", genFile},
 		OutputDir: outDir,
 		Inputs:    []string{inFile},
 	}
@@ -45,7 +66,6 @@ func TestGeneratorRunAndIncremental(t *testing.T) {
 		t.Fatalf("expected ExtraSourceRoots to have outDir, got: %v", bc.ExtraSourceRoots)
 	}
 
-	genFile := filepath.Join(outDir, "Generated.java")
 	fi, err := os.Stat(genFile)
 	if err != nil {
 		t.Fatalf("generated file does not exist: %v", err)
