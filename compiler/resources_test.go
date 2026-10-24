@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 jv contributors
+// Copyright mxreal64, 2026
 
 package compiler
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -16,6 +17,7 @@ func exists(p string) bool {
 }
 
 func TestCopyResourcesRemovesStaleFiles(t *testing.T) {
+	ctx := context.Background()
 	dir := t.TempDir()
 	src, dst := filepath.Join(dir, "src"), filepath.Join(dir, "dst")
 	write := func(rel, body string) {
@@ -38,7 +40,7 @@ func TestCopyResourcesRemovesStaleFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := CopyResources(src, dst); err != nil {
+	if err := CopyResources(ctx, src, dst, false, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !exists(filepath.Join(dst, "a", "x.txt")) || !exists(filepath.Join(dst, "b.txt")) {
@@ -49,7 +51,7 @@ func TestCopyResourcesRemovesStaleFiles(t *testing.T) {
 	if err := os.RemoveAll(filepath.Join(src, "a")); err != nil {
 		t.Fatal(err)
 	}
-	if err := CopyResources(src, dst); err != nil {
+	if err := CopyResources(ctx, src, dst, false, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if exists(filepath.Join(dst, "a", "x.txt")) || exists(filepath.Join(dst, "a")) {
@@ -65,7 +67,7 @@ func TestCopyResourcesRemovesStaleFiles(t *testing.T) {
 	if err := os.Chtimes(filepath.Join(src, "b.txt"), old, old); err != nil {
 		t.Fatal(err)
 	}
-	if err := CopyResources(src, dst); err != nil {
+	if err := CopyResources(ctx, src, dst, false, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := os.ReadFile(filepath.Join(dst, "b.txt")); string(got) != "B" {
@@ -76,7 +78,7 @@ func TestCopyResourcesRemovesStaleFiles(t *testing.T) {
 	if err := os.RemoveAll(src); err != nil {
 		t.Fatal(err)
 	}
-	if err := CopyResources(src, dst); err != nil {
+	if err := CopyResources(ctx, src, dst, false, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if exists(filepath.Join(dst, "b.txt")) {
@@ -84,5 +86,54 @@ func TestCopyResourcesRemovesStaleFiles(t *testing.T) {
 	}
 	if !exists(filepath.Join(dst, "App.class")) {
 		t.Error("App.class must survive")
+	}
+}
+
+func TestResourceFiltering(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	src, dst := filepath.Join(dir, "src"), filepath.Join(dir, "dst")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	props := map[string]string{
+		"project.version": "1.2.3",
+		"app.name":        "my-cool-app",
+	}
+
+	// 1. .properties file with ${key} and @key@
+	propContent := "version=${project.version}\nname=@app.name@\nunknown=${nope}\n"
+	if err := os.WriteFile(filepath.Join(src, "application.properties"), []byte(propContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Binary file .png
+	pngBytes := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, '$', '{', 'p', 'r', 'o', 'j', 'e', 'c', 't', '.', 'v', 'e', 'r', 's', 'i', 'o', 'n', '}'}
+	if err := os.WriteFile(filepath.Join(src, "logo.png"), pngBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := CopyResources(ctx, src, dst, true, props, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify property substitutions
+	gotProp, err := os.ReadFile(filepath.Join(dst, "application.properties"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedProp := "version=1.2.3\nname=my-cool-app\nunknown=${nope}\n"
+	if string(gotProp) != expectedProp {
+		t.Fatalf("expected:\n%s\ngot:\n%s", expectedProp, string(gotProp))
+	}
+
+	// Verify binary is untouched
+	gotPng, err := os.ReadFile(filepath.Join(dst, "logo.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotPng) != string(pngBytes) {
+		t.Fatalf("binary file was modified during filtering")
 	}
 }

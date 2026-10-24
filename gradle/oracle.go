@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 jv contributors
+// Copyright mxreal64, 2026
 
 // Package gradle gets a build's model from a real Gradle instead of re-implementing the
 // Groovy/Kotlin DSL: an init script dumps every Java project's source dirs, resolved
@@ -301,6 +301,7 @@ func SaveCache(root, key string, m *Model) error {
 var allowedPluginPrefixes = []string{
 	"org.gradle.api.plugins.", "org.gradle.language.base.plugins.", "org.gradle.api.publish.",
 	"org.gradle.testing.jacoco.", "org.gradle.plugins.ide.", "org.gradle.api.reporting.",
+	"org.gradle.buildinit.plugins.", "org.gradle.testing.base.plugins.",
 }
 
 var deniedPluginPrefixes = []string{

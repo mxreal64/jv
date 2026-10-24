@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 jv contributors
+// Copyright mxreal64, 2026
 
 package compiler
 
@@ -9,7 +9,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -165,96 +164,6 @@ func Compile(ctx context.Context, srcDir, outDir string, classpath []string, opt
 		return false, err
 	}
 	return true, os.WriteFile(stamp, []byte(sig), 0o644)
-}
-
-// resourceManifestPath returns the manifest file tracking what CopyResources copied.
-func resourceManifestPath(dst string) string {
-	return filepath.Join(dst, ".jv-resources")
-}
-
-func readManifest(path string) map[string]bool {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	out := map[string]bool{}
-	for _, line := range strings.Split(string(data), "\n") {
-		if line != "" {
-			out[line] = true
-		}
-	}
-	return out
-}
-
-// CopyResources copies src into dst (no filtering), skipping up-to-date files.
-// Tracks copied files in .jv-resources and removes stale files from previous runs.
-func CopyResources(src, dst string) error {
-	manifestPath := resourceManifestPath(dst)
-	if st, err := os.Stat(src); err != nil || !st.IsDir() {
-		if old := readManifest(manifestPath); len(old) > 0 {
-			for rel := range old {
-				_ = os.Remove(filepath.Join(dst, rel))
-			}
-			pruneEmptyDirs(dst)
-			_ = os.Remove(manifestPath)
-		}
-		return nil
-	}
-	oldManifest := readManifest(manifestPath)
-	newManifest := map[string]bool{}
-	if err := filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, _ := filepath.Rel(src, p)
-		target := filepath.Join(dst, rel)
-		if d.IsDir() {
-			return os.MkdirAll(target, 0o755)
-		}
-		newManifest[rel] = true
-		si, err := d.Info()
-		if err != nil {
-			return err
-		}
-		if ti, err := os.Stat(target); err == nil && ti.Size() == si.Size() && ti.ModTime().Equal(si.ModTime()) {
-			return nil
-		}
-		in, err := os.Open(p)
-		if err != nil {
-			return err
-		}
-		defer in.Close()
-		out, err := os.Create(target)
-		if err != nil {
-			return err
-		}
-		if _, err := io.Copy(out, in); err != nil {
-			out.Close()
-			return err
-		}
-		if err := out.Close(); err != nil {
-			return err
-		}
-		_ = os.Chtimes(target, si.ModTime(), si.ModTime())
-		return nil
-	}); err != nil {
-		return err
-	}
-	for rel := range oldManifest {
-		if !newManifest[rel] {
-			_ = os.Remove(filepath.Join(dst, rel))
-		}
-	}
-	if len(oldManifest) > 0 {
-		pruneEmptyDirs(dst)
-	}
-	lines := make([]string, 0, len(newManifest))
-	for rel := range newManifest {
-		lines = append(lines, rel)
-	}
-	sort.Strings(lines)
-	_ = os.WriteFile(manifestPath, []byte(strings.Join(lines, "\n")), 0o644)
-	return nil
 }
 
 // pruneEmptyDirs removes empty subdirectories of root (deepest first).
