@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -185,6 +186,32 @@ func TestLSPClasspathNoDeps(t *testing.T) {
 	// No deps declared → empty (or only module-local) classpath; at minimum no crash.
 }
 
+// lockedBuffer lets RunLSP (writer goroutine) and the test (reader) share one
+// output buffer; a bare bytes.Buffer is not safe for concurrent use.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// nextJSON decodes and consumes one complete JSON value, if one is available.
+func (b *lockedBuffer) nextJSON() (map[string]interface{}, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	dec := json.NewDecoder(bytes.NewReader(b.buf.Bytes()))
+	var v map[string]interface{}
+	if dec.Decode(&v) != nil {
+		return nil, false
+	}
+	b.buf.Next(int(dec.InputOffset())) // consume exactly the bytes decoded
+	return v, true
+}
+
 // TestLSPCacheInvalidation checks that modifying pom.xml causes the cache to be
 // treated as stale on the next request.
 func TestLSPCacheInvalidation(t *testing.T) {
@@ -200,7 +227,7 @@ func TestLSPCacheInvalidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var out bytes.Buffer
+	var out lockedBuffer
 	done := make(chan error, 1)
 	go func() { done <- cmd.RunLSP(ctx, dir, pr, &out) }()
 
@@ -214,12 +241,7 @@ func TestLSPCacheInvalidation(t *testing.T) {
 		deadline := time.Now().Add(10 * time.Second)
 		for time.Now().Before(deadline) {
 			time.Sleep(5 * time.Millisecond)
-			snap := out.Bytes()
-			dec := json.NewDecoder(bytes.NewReader(snap))
-			var v map[string]interface{}
-			if dec.Decode(&v) == nil {
-				// consume exactly the bytes decoded
-				out.Next(int(dec.InputOffset()))
+			if v, ok := out.nextJSON(); ok {
 				return v
 			}
 		}
