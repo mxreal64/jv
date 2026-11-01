@@ -149,12 +149,12 @@ func TestLSPSourceRoots(t *testing.T) {
 		t.Error("expected at least one main source root")
 	}
 	for _, p := range resp.Result.Main {
-		if !strings.HasSuffix(p, "src/main/java") {
+		if !strings.HasSuffix(filepath.ToSlash(p), "src/main/java") {
 			t.Errorf("unexpected main root: %s", p)
 		}
 	}
 	for _, p := range resp.Result.Test {
-		if !strings.HasSuffix(p, "src/test/java") {
+		if !strings.HasSuffix(filepath.ToSlash(p), "src/test/java") {
 			t.Errorf("unexpected test root: %s", p)
 		}
 	}

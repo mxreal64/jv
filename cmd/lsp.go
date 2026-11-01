@@ -32,11 +32,11 @@ type LSPResponse struct {
 
 // lspState is the mutable server state shared between requests.
 type lspState struct {
-	mu       sync.Mutex
-	loader   *resolver.Loader
-	mods     []*resolver.Module
-	arts     map[string][]resolver.Artifact // keyed by module Dir
-	mtimes   map[string]time.Time           // pom.xml / jv.toml → last known mtime
+	mu     sync.Mutex
+	loader *resolver.Loader
+	mods   []*resolver.Module
+	arts   map[string][]resolver.Artifact // keyed by module Dir
+	mtimes map[string]time.Time           // pom.xml / jv.toml → last known mtime
 }
 
 // RunLSP starts the classpath server. It reads one JSON request per line from
