@@ -183,7 +183,13 @@ func TestLSPClasspathNoDeps(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
 	}
-	// No deps declared → empty (or only module-local) classpath; at minimum no crash.
+	// No deps declared → empty classpath; it must serialize as [] (not null) for clients.
+	if resp.Result.Classpath == nil {
+		t.Error("classpath must be an empty list, not null")
+	}
+	if !bytes.Contains(outBytes, []byte(`"classpath":[]`)) {
+		t.Errorf("response should contain an empty JSON array, got %s", outBytes)
+	}
 }
 
 // lockedBuffer lets RunLSP (writer goroutine) and the test (reader) share one

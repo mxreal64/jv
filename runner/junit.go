@@ -51,6 +51,10 @@ type Config struct {
 	Excludes       []string // --exclude-classname regexes
 	Groups         string   // comma-separated JUnit tag expression → --include-tag
 	ExcludedGroups string   // comma-separated JUnit tag expression → --exclude-tag
+
+	// Dir is the module directory. The test JVM starts there and relative Scan and Reports paths
+	// are resolved against it, so builds never depend on the process working directory.
+	Dir string
 }
 
 // RunTestsIn is RunTests with an explicit layout.
@@ -61,6 +65,14 @@ func RunTestsIn(ctx context.Context, cfg Config, launcher string, classpath []st
 	}
 	if reports == "" {
 		reports = "target/surefire-reports"
+	}
+	if cfg.Dir != "" {
+		if !filepath.IsAbs(scan) {
+			scan = filepath.Join(cfg.Dir, scan)
+		}
+		if !filepath.IsAbs(reports) {
+			reports = filepath.Join(cfg.Dir, reports)
+		}
 	}
 	if st, err := os.Stat(scan); err != nil || !st.IsDir() {
 		fmt.Fprintln(os.Stderr, "[jv] No tests found.")
@@ -155,6 +167,7 @@ func RunTestsIn(ctx context.Context, cfg Config, launcher string, classpath []st
 	}
 
 	cmd := exec.CommandContext(ctx, javaBinary(), args...)
+	cmd.Dir = cfg.Dir
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError

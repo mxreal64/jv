@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -21,6 +20,7 @@ import (
 	"github.com/mxreal64/jv/compiler"
 	"github.com/mxreal64/jv/config"
 	"github.com/mxreal64/jv/lifecycle"
+	"github.com/mxreal64/jv/model"
 	"github.com/mxreal64/jv/packager"
 	"github.com/mxreal64/jv/plugins/codegen"
 	"github.com/mxreal64/jv/plugins/enforcer"
@@ -52,6 +52,11 @@ install     package and copy into the local repository
 clean       remove target/ and .jv/
 classpath [compile|runtime|test]   print the resolved classpath (default: test)
 tree        print the resolved dependency tree
+explain <dep>   show why a dependency is on the classpath (artifactId, group:artifactId[:version])
+audit       check the resolved dependencies against the OSV vulnerability database
+            (-Daudit.failOn=none|low|medium|high|critical, -Daudit.json=true; exit 1 on findings)
+upgrade     list dependencies that have a newer release (-Dupgrade.all=true includes transitive ones)
+init        create a new Maven project here (-DgroupId= -DartifactId= -Dversion= -Dtype=spring-boot)
 Any other goal or plugin is delegated transparently to mvn (or Gradle if in a Gradle project).
 In a Gradle project jv asks Gradle once for the project model (cached in .jv/) and then compiles,
 tests and packages natively; builds it cannot reproduce (Kotlin, annotation processors, custom
@@ -84,11 +89,16 @@ var nativeGoals = map[string]bool{
 	"classpath": true,
 	"tree":      true,
 	"lsp":       true,
+	"explain":   true,
+	"audit":     true,
+	"upgrade":   true,
+	"init":      true,
 }
 
 type cliOpts struct {
 	goals                          []string
 	scope                          string
+	query                          string // explain <query>
 	settingsFile                   string
 	offline, verbose, quiet        bool
 	help, version                  bool
@@ -166,6 +176,10 @@ func parseArgs(args []string) *cliOpts {
 				i++
 				o.scope = args[i]
 			}
+			if a == "explain" && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+				o.query = args[i]
+			}
 		}
 	}
 	o.skipTestCompilation = o.props["maven.test.skip"] == "true"
@@ -225,6 +239,21 @@ func run(args []string) int {
 		return 0
 	}
 
+	// jv init — scaffold a project; needs no existing build.
+	if len(o.goals) > 0 && o.goals[0] == "init" {
+		return runInit(o, root)
+	}
+	if hasAnalysisGoal(o.goals) {
+		if !hasPom {
+			errf("jv %s works on Maven projects and needs a pom.xml in this directory", strings.Join(o.goals, " "))
+			return 2
+		}
+		if o.goals[0] == "explain" && o.query == "" {
+			errf("usage: jv explain <artifactId | groupId:artifactId[:version]>")
+			return 2
+		}
+	}
+
 	// If no pom.xml is found, but Gradle project is detected, delegate to Gradle
 	if !hasPom && isGradle {
 		// Model-oracle mode: a real Gradle reports the project model once (cached), jv builds
@@ -242,7 +271,7 @@ func run(args []string) int {
 			if !hasPom && isGradle {
 				return bridge.FallbackToGradle(args)
 			}
-			return bridge.FallbackToMaven(args)
+			return fallbackMaven(args, root)
 		}
 	}
 	if len(o.unknown) > 0 {
@@ -250,7 +279,7 @@ func run(args []string) int {
 			return bridge.FallbackToGradle(args)
 		}
 		logf("flag(s) %s not handled natively; delegating to mvn", strings.Join(o.unknown, " "))
-		return bridge.FallbackToMaven(args)
+		return fallbackMaven(args, root)
 	}
 
 	if _, err := pom.ParsePOM(filepath.Join(root, "pom.xml")); err != nil {
@@ -259,7 +288,7 @@ func run(args []string) int {
 			return bridge.FallbackToGradle(args)
 		}
 		logf("no usable pom.xml (%v); delegating to mvn", err)
-		return bridge.FallbackToMaven(args)
+		return fallbackMaven(args, root)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -303,7 +332,18 @@ func run(args []string) int {
 		return 0
 	}
 
-	loader := resolver.NewLoader(ctx, settings.RepoDir(), settings)
+	repoDir := settings.RepoDir()
+	if ap, aerr := filepath.Abs(repoDir); aerr == nil {
+		repoDir = ap // modules build concurrently: nothing may depend on the working directory
+	}
+	loader := resolver.NewLoader(ctx, repoDir, settings)
+	if u := os.Getenv("JV_CACHE_URL"); u != "" && !o.offline {
+		loader.Dist = resolver.NewDistCache(u, os.Getenv("JV_CACHE_TOKEN"))
+		defer loader.FlushDist()
+		if resolver.InsecureCacheURL(u) {
+			logf("warning: JV_CACHE_URL uses plain http; artifacts are still verified against their SHA-1, but traffic and token are unprotected")
+		}
+	}
 	loader.Offline, loader.Verbose, loader.Quiet, loader.ProfileIDs, loader.UserProps = o.offline, o.verbose, o.quiet, o.profiles, o.props
 	loader.UpdateSnapshots = o.updateSnapshots
 	loader.AddSettingsRepos(settings.ActiveRepos(o.profiles))
@@ -315,12 +355,12 @@ func run(args []string) int {
 	for _, m := range mods {
 		if p := m.Eff.Packaging; p != "jar" && p != "pom" {
 			logf("module %s uses packaging %q, which is not handled natively; delegating to mvn", m.Eff.A, p)
-			return bridge.FallbackToMaven(args)
+			return fallbackMaven(args, root)
 		}
 	}
 	needsBuild := false
 	for _, g := range build {
-		if g != "clean" && g != "classpath" && g != "tree" {
+		if g != "clean" && g != "classpath" && g != "tree" && !analysisGoals[g] {
 			needsBuild = true
 		}
 	}
@@ -331,7 +371,7 @@ func run(args []string) int {
 		msg := fmt.Sprintf("module %s uses <build> settings jv does not honour: %s", m.Eff.A, strings.Join(m.Eff.Unsupported, ", "))
 		if needsBuild && os.Getenv("JV_IGNORE_BUILD_CONFIG") == "" {
 			logf("%s; delegating to mvn (set JV_IGNORE_BUILD_CONFIG=1 to build natively anyway)", msg)
-			return bridge.FallbackToMaven(args)
+			return fallbackMaven(args, root)
 		}
 		logf("warning: %s", msg)
 	}
@@ -365,7 +405,7 @@ func run(args []string) int {
 			continue
 		}
 		targets := ordered
-		if (goal == "classpath" || goal == "tree") && len(o.pl) > 0 {
+		if (goal == "classpath" || goal == "tree" || analysisGoals[goal]) && len(o.pl) > 0 {
 			if targets, err = resolver.SelectOnly(ordered, root, o.pl); err != nil {
 				errf("%v", err)
 				return 1
@@ -383,109 +423,19 @@ func run(args []string) int {
 				return 1
 			}
 		}
-		if len(targets) > 1 && (goal == "compile" || goal == "test-compile") {
-			byGAV := make(map[string]*resolver.Module, len(targets))
-			byGA := make(map[string]*resolver.Module, len(targets))
-			for _, m := range targets {
-				byGAV[m.GAV()] = m
-				byGA[m.Eff.G+":"+m.Eff.A] = m
+		if analysisGoals[goal] {
+			if code := runAnalysis(ctx, loader, targets, goal, o); code != 0 {
+				return code
 			}
-			dependents := make(map[*resolver.Module][]*resolver.Module, len(targets))
-			inDegree := make(map[*resolver.Module]int, len(targets))
-			for _, m := range targets {
-				depsSeen := make(map[*resolver.Module]bool)
-				if m.Eff != nil {
-					for _, d := range m.Eff.Deps {
-						var depMod *resolver.Module
-						if dm := byGAV[d.GroupID+":"+d.ArtifactID+":"+d.Version]; dm != nil && dm != m {
-							depMod = dm
-						} else if dm := byGA[d.GroupID+":"+d.ArtifactID]; dm != nil && dm != m {
-							depMod = dm
-						}
-						if depMod != nil && !depsSeen[depMod] {
-							depsSeen[depMod] = true
-							dependents[depMod] = append(dependents[depMod], m)
-							inDegree[m]++
-						}
-					}
-				}
+			continue
+		}
+		if err := buildTargets(ctx, loader, targets, goal, o); err != nil {
+			if ctx.Err() != nil {
+				errf("interrupted")
+			} else {
+				errf("%v", err)
 			}
-			workers := len(targets)
-			if n := runtime.NumCPU(); workers > n {
-				workers = n
-			}
-			if workers < 1 {
-				workers = 1
-			}
-			ready := make(chan *resolver.Module, len(targets))
-			for _, m := range targets {
-				if inDegree[m] == 0 {
-					ready <- m
-				}
-			}
-			var mu sync.Mutex
-			var firstErr error
-			completed := 0
-			var wg sync.WaitGroup
-			wg.Add(workers)
-			rctx, rcancel := context.WithCancel(ctx)
-			defer rcancel()
-			for i := 0; i < workers; i++ {
-				go func() {
-					defer wg.Done()
-					for {
-						select {
-						case <-rctx.Done():
-							return
-						case m, ok := <-ready:
-							if !ok {
-								return
-							}
-							err := buildModule(rctx, loader, m, goal, o, true)
-							mu.Lock()
-							if err != nil {
-								if firstErr == nil {
-									firstErr = err
-									rcancel()
-								}
-								mu.Unlock()
-								return
-							}
-							completed++
-							for _, dep := range dependents[m] {
-								inDegree[dep]--
-								if inDegree[dep] == 0 {
-									ready <- dep
-								}
-							}
-							if completed == len(targets) {
-								close(ready)
-							}
-							mu.Unlock()
-						}
-					}
-				}()
-			}
-			wg.Wait()
-			if firstErr != nil {
-				if ctx.Err() != nil {
-					errf("interrupted")
-				} else {
-					errf("%v", firstErr)
-				}
-				return 1
-			}
-		} else {
-			for _, m := range targets {
-				if err := buildModule(ctx, loader, m, goal, o, len(targets) > 1); err != nil {
-					if ctx.Err() != nil {
-						errf("interrupted")
-					} else {
-						errf("%s: %v", m.Eff.A, err)
-					}
-					return 1
-				}
-			}
+			return 1
 		}
 	}
 	logf("done in %v", time.Since(start).Round(time.Millisecond))
@@ -493,7 +443,7 @@ func run(args []string) int {
 }
 
 func resolveModule(loader *resolver.Loader, m *resolver.Module, forTree bool, mlog func(string, ...any)) ([]resolver.Artifact, []*resolver.Node, error) {
-	const lock = ".jv/lock.json"
+	lock := filepath.Join(m.Dir, ".jv", "lock.json")
 	if !forTree && !loader.UpdateSnapshots {
 		if cached, ok := resolver.ReadLock(lock, m.Key); ok {
 			mlog("using cached resolution (%d artifacts)", len(cached))
@@ -542,22 +492,23 @@ func makeBuildContext(m *resolver.Module, arts []resolver.Artifact, loader *reso
 		}
 	}
 
+	abs := func(rel string) string { return filepath.Join(m.Dir, filepath.FromSlash(rel)) }
 	return lifecycle.BuildContext{
 		Group:                 m.Eff.G,
 		Artifact:              m.Eff.A,
 		Version:               m.Eff.V,
 		Packaging:             m.Eff.Packaging,
 		Dir:                   m.Dir,
-		SourceDirs:            []string{"src/main/java"},
-		TestSourceDirs:        []string{"src/test/java"},
-		ResourceDirs:          []string{"src/main/resources"},
-		TestResourceDirs:      []string{"src/test/resources"},
+		SourceDirs:            []string{abs("src/main/java")},
+		TestSourceDirs:        []string{abs("src/test/java")},
+		ResourceDirs:          []string{abs("src/main/resources")},
+		TestResourceDirs:      []string{abs("src/test/resources")},
 		ResourceFiltering:     filtering,
 		TestResourceFiltering: testFiltering,
-		ClassesDir:            "target/classes",
-		TestClassesDir:        "target/test-classes",
-		GeneratedDir:          "target/generated-sources/annotations",
-		TargetDir:             "target",
+		ClassesDir:            abs("target/classes"),
+		TestClassesDir:        abs("target/test-classes"),
+		GeneratedDir:          abs("target/generated-sources/annotations"),
+		TargetDir:             abs("target"),
 		CompileCP:             resolver.Classpath(arts, "compile"),
 		TestCP:                resolver.Classpath(arts, "test"),
 		RuntimeCP:             resolver.Classpath(arts, "runtime"),
@@ -575,6 +526,7 @@ func buildLifecycle(
 	arts []resolver.Artifact,
 	o *cliOpts,
 	mlog func(string, ...any),
+	jvTest model.TestConfig,
 ) *lifecycle.Lifecycle {
 	lc := lifecycle.New()
 
@@ -718,8 +670,11 @@ func buildLifecycle(
 				return fmt.Errorf("fetching JUnit launcher: %w", err)
 			}
 		}
-		sfCfg := m.Eff.Build.SurefireConfig()
+		sfCfg := applyJVTestConfig(m.Eff.Build.SurefireConfig(), jvTest)
 		runCfg := runner.Config{
+			Dir:            bc.Dir,
+			Scan:           bc.TestClassesDir,
+			Reports:        filepath.Join(bc.TargetDir, "surefire-reports"),
 			JVMArgs:        jvmArgsFromArgLine(sfCfg.ArgLine, bc.Props),
 			SysProps:       sfCfg.SysProps,
 			Groups:         sfCfg.Groups,
@@ -826,10 +781,24 @@ func buildLifecycle(
 	return lc
 }
 
+// preparedModule is a module whose dependencies are resolved and whose lifecycle is ready to run.
+type preparedModule struct {
+	lc *lifecycle.Lifecycle
+	bc lifecycle.BuildContext
+}
+
 func buildModule(ctx context.Context, loader *resolver.Loader, m *resolver.Module, goal string, o *cliOpts, multi bool) error {
-	if err := os.Chdir(m.Dir); err != nil {
+	pm, err := prepareModule(ctx, loader, m, goal, o, multi)
+	if err != nil || pm == nil {
 		return err
 	}
+	return pm.lc.RunUpTo(ctx, lifecycle.Phase(goal), pm.bc)
+}
+
+// prepareModule resolves the module's dependencies and builds its lifecycle. Goals that need no
+// lifecycle (pom modules, tree, classpath) are completed here and yield a nil result. It never
+// changes the working directory, so any number of modules can be prepared and built concurrently.
+func prepareModule(ctx context.Context, loader *resolver.Loader, m *resolver.Module, goal string, o *cliOpts, multi bool) (*preparedModule, error) {
 	mlog := func(format string, a ...any) {
 		if multi {
 			logf("["+m.Eff.A+"] "+format, a...)
@@ -840,23 +809,36 @@ func buildModule(ctx context.Context, loader *resolver.Loader, m *resolver.Modul
 	if m.Eff.Packaging == "pom" {
 		if goal == "install" {
 			mlog("installing pom")
-			return packager.Install(loader.Repo, m.Eff.G, m.Eff.A, m.Eff.V, "", m.POMFile)
+			return nil, packager.Install(loader.Repo, m.Eff.G, m.Eff.A, m.Eff.V, "", m.POMFile)
 		}
-		return nil
+		return nil, nil
 	}
 	arts, nodes, err := resolveModule(loader, m, goal == "tree", mlog)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Non-lifecycle goals handled directly.
 	switch goal {
 	case "tree":
 		fmt.Printf("%s:%s:%s\n", m.Eff.G, m.Eff.A, m.Eff.V)
 		resolver.PrintTree(os.Stdout, nodes)
-		return nil
+		return nil, nil
 	case "classpath":
 		fmt.Println(strings.Join(resolver.Classpath(arts, o.scope), string(os.PathListSeparator)))
-		return nil
+		return nil, nil
+	}
+
+	// jv.toml: jv's own per-module settings, layered over the POM (command-line -D still wins).
+	jt, err := model.Load(m.Dir)
+	if err != nil {
+		return nil, err
+	}
+	for _, w := range jt.Warnings {
+		mlog("warning: jv.toml: %s", w)
+	}
+	if len(jt.Plugins)+len(jt.Generators) > 0 {
+		return nil, fmt.Errorf("jv.toml declares [[plugin]] or [[generator]] entries, which jv does not run yet; " +
+			"remove them (or build this project with mvn) rather than have them silently skipped")
 	}
 
 	// Build effective props: POM props + plugin-management compiler overrides.
@@ -870,10 +852,68 @@ func buildModule(ctx context.Context, loader *resolver.Loader, m *resolver.Modul
 		}
 	}
 
+	for k, v := range map[string]string{
+		"maven.compiler.release":       jt.Build.Release,
+		"maven.compiler.source":        jt.Build.Source,
+		"project.build.sourceEncoding": jt.Build.Encoding,
+	} {
+		if _, fromCLI := o.props[k]; v != "" && !fromCLI {
+			effProps[k] = v
+		}
+	}
+
 	bc := makeBuildContext(m, arts, loader, effProps)
-	lc := buildLifecycle(ctx, loader, m, arts, o, mlog)
-	if err := lc.RunUpTo(ctx, lifecycle.Phase(goal), bc); err != nil {
+	return &preparedModule{lc: buildLifecycle(ctx, loader, m, arts, o, mlog, jt.Test), bc: bc}, nil
+}
+
+// buildTargets builds the selected modules for one goal. Modules whose dependencies are done
+// compile in parallel (JV_JOBS workers, default one per CPU). The phases after test-compile (tests,
+// packaging, install) then run one module at a time in dependency order, as Maven does, so tests
+// of different modules never run concurrently.
+func buildTargets(ctx context.Context, loader *resolver.Loader, targets []*resolver.Module, goal string, o *cliOpts) error {
+	multi := len(targets) > 1
+	idx := lifecycle.IndexOf(lifecycle.Phase(goal))
+	if !multi || idx < 0 {
+		for _, m := range targets {
+			if err := buildModule(ctx, loader, m, goal, o, multi); err != nil {
+				return fmt.Errorf("%s: %w", m.Eff.A, err)
+			}
+		}
+		return nil
+	}
+
+	const split = lifecycle.Phase("test-compile")
+	first := lifecycle.Phase(goal)
+	if idx > lifecycle.IndexOf(split) {
+		first = split
+	}
+	var prepared sync.Map // *resolver.Module -> *preparedModule
+	err := lifecycle.RunGraph(ctx, targets, lifecycle.DefaultWorkers(), func(c context.Context, m *resolver.Module) error {
+		pm, err := prepareModule(c, loader, m, goal, o, true)
+		if err != nil {
+			return fmt.Errorf("%s: %w", m.Eff.A, err)
+		}
+		if pm == nil {
+			return nil
+		}
+		if err := pm.lc.RunUpTo(c, first, pm.bc); err != nil {
+			return fmt.Errorf("%s: %w", m.Eff.A, err)
+		}
+		prepared.Store(m, pm)
+		return nil
+	})
+	if err != nil || first == lifecycle.Phase(goal) {
 		return err
+	}
+	for _, m := range targets { // targets are in dependency order
+		v, ok := prepared.Load(m)
+		if !ok {
+			continue
+		}
+		pm := v.(*preparedModule)
+		if err := pm.lc.RunAfter(ctx, split, lifecycle.Phase(goal), pm.bc); err != nil {
+			return fmt.Errorf("%s: %w", m.Eff.A, err)
+		}
 	}
 	return nil
 }
@@ -885,6 +925,36 @@ func hasLauncher(arts []resolver.Artifact) bool {
 		}
 	}
 	return false
+}
+
+// applyJVTestConfig layers the [test] table of jv.toml over the surefire configuration of the POM:
+// every setting that jv.toml gives replaces the POM's.
+func applyJVTestConfig(cfg pom.SurefireCfg, t model.TestConfig) pom.SurefireCfg {
+	if len(t.Includes) > 0 {
+		cfg.Includes = t.Includes
+	}
+	if len(t.Excludes) > 0 {
+		cfg.Excludes = t.Excludes
+	}
+	if t.Groups != "" {
+		cfg.Groups = t.Groups
+	}
+	if t.ExcludedGroups != "" {
+		cfg.ExcludedGroups = t.ExcludedGroups
+	}
+	if t.ArgLine != "" {
+		cfg.ArgLine = t.ArgLine
+	}
+	return cfg
+}
+
+// fallbackMaven hands the build to mvn. jv.toml is jv's own file, so mvn cannot see it; say so rather
+// than silently dropping its settings.
+func fallbackMaven(args []string, root string) int {
+	if _, err := os.Stat(filepath.Join(root, "jv.toml")); err == nil {
+		logf("warning: jv.toml settings are ignored because this build is delegated to mvn")
+	}
+	return bridge.FallbackToMaven(args)
 }
 
 // jvmArgsFromArgLine splits a surefire argLine into individual JVM args.

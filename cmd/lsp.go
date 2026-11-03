@@ -201,7 +201,7 @@ func (st *lspState) lspStale() bool {
 
 func lspDedup(ss []string) []string {
 	seen := make(map[string]struct{}, len(ss))
-	out := ss[:0]
+	out := make([]string, 0, len(ss)) // never nil: clients get [] rather than null
 	for _, s := range ss {
 		if s == "" {
 			continue

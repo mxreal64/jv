@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mxreal64/jv/compiler/abi"
 	"github.com/mxreal64/jv/compiler/worker"
 )
 
@@ -93,8 +94,8 @@ func Compile(ctx context.Context, srcDir, outDir string, classpath []string, opt
 		if filepath.Clean(e) == filepath.Clean(outDir) {
 			continue // our own output (test-classes is on its own classpath): its stamp changes every run
 		}
-		if st, err := os.Stat(filepath.Join(e, ".jv-stamp")); err == nil {
-			fmt.Fprintf(&in, "\n%s@%d", e, st.ModTime().UnixNano())
+		if state, ok := upstreamState(e); ok {
+			fmt.Fprintf(&in, "\n%s@%s", e, state)
 		}
 	}
 	sum := sha256.Sum256([]byte(in.String()))
@@ -173,7 +174,7 @@ func Compile(ctx context.Context, srcDir, outDir string, classpath []string, opt
 			if err := w.Compile(ctx, workerArgs, ""); err != nil {
 				return false, err
 			}
-			return true, os.WriteFile(stamp, []byte(sig), 0o644)
+			return true, finishCompile(outDir, stamp, sig)
 		}
 	}
 
@@ -182,7 +183,33 @@ func Compile(ctx context.Context, srcDir, outDir string, classpath []string, opt
 	if err := cmd.Run(); err != nil {
 		return false, err
 	}
-	return true, os.WriteFile(stamp, []byte(sig), 0o644)
+	return true, finishCompile(outDir, stamp, sig)
+}
+
+// abiFile holds the ABI fingerprint of a compiled output directory.
+const abiFile = ".jv-abi"
+
+// finishCompile records a successful build: the ABI fingerprint of the output first, then the stamp.
+// Modules that compile against this output are keyed on the fingerprint, so they are not rebuilt
+// when only method bodies or private members changed here.
+func finishCompile(outDir, stamp, sig string) error {
+	if a, err := abi.Signature(outDir); err == nil && a != "" {
+		_ = os.WriteFile(filepath.Join(outDir, abiFile), []byte(a), 0o644)
+	}
+	return os.WriteFile(stamp, []byte(sig), 0o644)
+}
+
+// upstreamState describes a classpath directory for the downstream build key: its ABI fingerprint
+// when known, otherwise the time of its last build (which forces a rebuild after every upstream
+// compile, the safe default for directories jv did not produce itself).
+func upstreamState(dir string) (string, bool) {
+	if b, err := os.ReadFile(filepath.Join(dir, abiFile)); err == nil && len(b) > 0 {
+		return "abi:" + string(b), true
+	}
+	if st, err := os.Stat(filepath.Join(dir, ".jv-stamp")); err == nil {
+		return fmt.Sprintf("stamp:%d", st.ModTime().UnixNano()), true
+	}
+	return "", false
 }
 
 var (

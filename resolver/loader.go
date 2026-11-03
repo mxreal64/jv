@@ -94,6 +94,11 @@ type Loader struct {
 
 	UpdateSnapshots bool // -U: re-check remote SNAPSHOTs even when a copy is cached
 
+	// Dist, when set, is a shared jv-cache server. It is consulted before an artifact is downloaded
+	// from a repository and fed after a verified download. Call FlushDist before the process exits.
+	Dist   *DistCache
+	distWG sync.WaitGroup
+
 	ctx    context.Context
 	mods   map[string]*Module
 	client *http.Client
@@ -274,6 +279,20 @@ func (l *Loader) get(ctx context.Context, b repoRef, url string) (*http.Response
 func (l *Loader) tryDownload(b repoRef, url, dest string, verify bool) error {
 	l.sem <- struct{}{}
 	defer func() { <-l.sem }()
+	// The origin's published checksum identifies the artifact: it is the shared-cache key and the proof
+	// that a cached blob is the right one, so it is fetched first.
+	var wantSum string
+	var haveSum, prefetched bool
+	if verify && l.Dist != nil {
+		prefetched = true
+		if wantSum, haveSum = l.fetchSum(b, url+".sha1"); haveSum && l.fromDist(wantSum, dest) {
+			if l.Verbose {
+				fmt.Fprintf(os.Stderr, "[jv] shared cache hit %s\n", baseName(url))
+			}
+			return nil
+		}
+	}
+
 	if l.Verbose {
 		fmt.Fprintf(os.Stderr, "[jv] GET %s\n", url)
 	}
@@ -313,9 +332,11 @@ func (l *Loader) tryDownload(b repoRef, url, dest string, verify bool) error {
 		return err
 	}
 	if verify {
-		want, ok := l.fetchSum(b, url+".sha1")
+		if !prefetched {
+			wantSum, haveSum = l.fetchSum(b, url+".sha1")
+		}
 		switch {
-		case !ok:
+		case !haveSum:
 			if os.Getenv("JV_REQUIRE_CHECKSUMS") != "" {
 				os.Remove(tmp.Name())
 				return fmt.Errorf("%w: no checksum available for %s (JV_REQUIRE_CHECKSUMS is set)", errPermanent, url)
@@ -323,7 +344,7 @@ func (l *Loader) tryDownload(b repoRef, url, dest string, verify bool) error {
 			if l.Verbose {
 				fmt.Fprintf(os.Stderr, "[jv] warning: no checksum available for %s; not verified\n", url)
 			}
-		case want != hex.EncodeToString(h.Sum(nil)):
+		case wantSum != hex.EncodeToString(h.Sum(nil)):
 			os.Remove(tmp.Name())
 			return fmt.Errorf("%w: checksum mismatch for %s", errPermanent, url)
 		}
@@ -332,8 +353,57 @@ func (l *Loader) tryDownload(b repoRef, url, dest string, verify bool) error {
 		os.Remove(tmp.Name())
 		return fmt.Errorf("%w: %v", errPermanent, err)
 	}
+	if verify && haveSum && l.Dist != nil {
+		l.distWG.Add(1)
+		go func() { // verified against the origin's checksum: share it
+			defer l.distWG.Done()
+			if err := l.Dist.Put(l.ctx, DistKey(wantSum), dest); err != nil && l.Verbose {
+				fmt.Fprintf(os.Stderr, "[jv] shared cache upload failed: %v\n", err)
+			}
+		}()
+	}
 	return nil
 }
+
+func baseName(url string) string {
+	if i := strings.LastIndex(url, "/"); i >= 0 {
+		return url[i+1:]
+	}
+	return url
+}
+
+// fromDist fetches the artifact with the given origin SHA-1 from the shared cache into dest. The
+// blob is only kept when its SHA-1 matches, so a misbehaving cache cannot inject content.
+func (l *Loader) fromDist(sum, dest string) bool {
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return false
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dest), ".jv-*")
+	if err != nil {
+		return false
+	}
+	name := tmp.Name()
+	tmp.Close()
+	ok, err := l.Dist.Get(l.ctx, DistKey(sum), name)
+	if err != nil || !ok {
+		os.Remove(name)
+		return false
+	}
+	got, err := fileSHA1(name)
+	if err != nil || got != sum {
+		os.Remove(name)
+		l.warnf("shared cache returned content that does not match its checksum for %s; ignoring it", baseName(dest))
+		return false
+	}
+	if err := os.Rename(name, dest); err != nil {
+		os.Remove(name)
+		return false
+	}
+	return true
+}
+
+// FlushDist waits for pending uploads to the shared cache.
+func (l *Loader) FlushDist() { l.distWG.Wait() }
 
 func (l *Loader) fetchSum(b repoRef, url string) (string, bool) {
 	ctx, cancel := context.WithTimeout(l.ctx, 30*time.Second)

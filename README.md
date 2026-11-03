@@ -16,27 +16,36 @@
 ```console
 $ cd my-project            # any Maven or Gradle project, untouched
 $ jv test                  # resolve, compile, run your JUnit tests
-$ jv package               # target/my-project-1.0.jar (or spring-boot / shaded fat jar)
+$ jv package               # target/my-project-1.0.jar
 ```
+
+> **Status:** pre-1.0 (release candidates). The core build paths are covered by tests, but try jv on a branch
+> before relying on it in CI. See [Known limitations](#known-limitations) and [Roadmap](#roadmap).
 
 ## Why jv
 
 - **Drop-in.** It reads the `pom.xml` or Gradle build you already have. No config, no migration, no
   lock-in: delete `jv` and nothing about your project has changed. It shares `~/.m2` with Maven.
-- **Never silently different.** When a build uses plugins or configurations jv doesn't reproduce natively,
-  jv tells you why and runs the real `mvn` or `gradle` instead. You get the same result, just not the speed-up.
+- **Never silently different.** When a build uses something jv can't reproduce exactly (plugin executions,
+  filtered resources, custom source directories, ...), jv tells you why and runs the real `mvn` or `gradle`
+  instead. You get the same result, just not the speed-up.
 - **Checked against Maven.** The test suite diffs jv's compile, runtime and test classpaths with
   `mvn dependency:build-classpath` on real dependency graphs (Spring Boot, Hadoop, Hibernate, Netty,
   AWS SDK, Maven core, Jackson, HttpClient, Log4j, and more).
 - **Fast where it counts.**
-  - **Parallel downloads** with checksum verification.
-  - **Parallel reactor builds** for multi-module projects.
-  - **Persistent javac worker** daemon eliminating JVM cold-start latency.
-  - **ABI fingerprinting** to skip downstream rebuilds when public method signatures haven't changed.
-  - **Cached resolutions** (`.jv/lock.json`) and content-addressable caching (CAS), with optional distributed caching (`jv-cache`).
-  - **Static Gradle Kotlin DSL parsing** (`ktsparse`) for instant zero-JVM compilation of Gradle projects, plus the Gradle model oracle for advanced builds.
-- **Native Popular Plugins.** Built-in native support for Spring Boot executable repackaging, Maven Shade fat-jars (with relocation and resource merging), Flatten Maven plugin, resource filtering with property interpolation, JaCoCo, and Enforcer.
-- **Developer Experience.** Dedicated commands for project initialization (`jv init`), dependency security audits (`jv audit`), version upgrades (`jv upgrade`), and dependency path visualization (`jv explain`).
+  - Parallel, checksum-verified downloads.
+  - Independent modules compile in parallel, in dependency order (`JV_JOBS` sets the worker count).
+  - A cached dependency resolution (`.jv/lock.json`).
+  - `javac` is skipped when nothing changed, and a module that depends on another is only rebuilt when
+    that module's *public interface* changed, not when just a method body did.
+  - An optional shared build cache for downloaded artifacts (`JV_CACHE_URL`, see [Shared cache](#shared-cache)).
+  - For Gradle, a single model query that is cached until your build scripts change.
+  - An optional persistent `javac` worker (experimental, off by default; see [Environment](#environment)).
+- **Dependency tooling built in.** `jv explain` (why is this on my classpath?), `jv audit` (known
+  vulnerabilities, via OSV) and `jv upgrade` (newer releases), plus `jv init` to start a project (see
+  [Dependency tools](#dependency-tools)).
+- **Editor-friendly.** `jv lsp` is a small JSON-lines server that reports a project's classpath, source
+  roots and coordinates (see [Editor integration](#editor-integration)).
 - **One static binary.** Linux, macOS and Windows on amd64 and arm64. The only thing it needs is a JDK.
 - **Free software.** GPL-3.0 (Copyright mxreal64, 2026).
 
@@ -64,15 +73,17 @@ delegates to them. Check it worked with `jv --version`.
 
 ```sh
 jv test              # resolve, compile and run JUnit tests
-jv package           # test, then build target/<artifactId>-<version>.jar (or fat-jar)
+jv package           # test, then build target/<artifactId>-<version>.jar
 jv install           # ...and install it into ~/.m2
 jv classpath test    # print the test classpath (IDEs, scripts, debugging)
-jv tree              # display the resolved dependency tree
-jv -pl app test      # one module of a multi-module build, plus required siblings
+jv tree              # print the resolved dependency tree
+jv explain guava     # why is guava on the classpath, and who asked for which version?
+jv audit             # check the dependencies against the OSV vulnerability database
+jv upgrade           # which dependencies have a newer release?
+jv init              # scaffold a new Maven project in the current (empty) directory
+jv -pl app test      # one module of a multi-module build, plus the siblings it needs
 jv clean install     # goals run in the order you type them
-jv audit             # scan dependencies for known CVE vulnerabilities
-jv upgrade           # check for newer versions of dependencies and wrappers
-jv -X test           # verbose logging: say whether build ran natively or was delegated
+jv -X test           # verbose: also say whether the build ran natively or was delegated
 ```
 
 Want it for every build? `alias mvn=jv` in your shell: anything jv doesn't handle goes to the real
@@ -83,127 +94,302 @@ Want it for every build? `alias mvn=jv` in your shell: anything jv doesn't handl
 ```
 jv <goal>
  |
- |-- pom.xml ----------> can jv reproduce this build natively?
- |                         |-- yes --> native: resolve -> javac -> JUnit -> jar/repackage
- |                         '-- no  --> "delegating to mvn because ..." (your build, unchanged)
+ |-- pom.xml ----------> can jv reproduce this build exactly?
+ |                         |-- yes --> native: resolve -> javac -> JUnit -> jar
+ |                         '-- no  --> "delegating to mvn because ..."   (your build, unchanged)
  |
- '-- build.gradle[.kts] -> static fast-path parser (ktsparse) or single Gradle model oracle query
-                           |-- reproducible --> native parallel compilation, testing & packaging
-                           '-- otherwise    --> real Gradle execution, arguments translated
+ '-- build.gradle[.kts] -> ask Gradle once for a model (cached in .jv/)
+                           |-- reproducible --> the same native steps
+                           '-- otherwise    --> Gradle itself, arguments translated
 ```
 
 jv prefers a loud hand-off to a quiet difference. See *Maven projects* and *Gradle projects* below for
-details on what runs natively and what delegates.
+exactly what runs natively and what is delegated.
 
 ## Usage reference
 
 ```
 jv compile | test | package | install | clean
-jv classpath [compile|runtime|test]     jv tree [query]
-jv init | audit | upgrade | explain <dep>
+jv classpath [compile|runtime|test]     jv tree     jv explain <dependency>
+jv audit [-Daudit.failOn=none|low|medium|high|critical] [-Daudit.json=true]
+jv upgrade [-Dupgrade.all=true] [-Dupgrade.json=true]
+jv init [-DgroupId=g] [-DartifactId=a] [-Dversion=v] [-Dtype=spring-boot]
+jv lsp
 jv -o -q -X -U -P profile -Dkey=value -pl module1,module2 -s settings.xml <goal>
 jv --version | -h
 ```
 
-`jv` automatically selects the build system: a `pom.xml` means Maven; otherwise a Gradle build
-(`build.gradle[.kts]`, `settings.gradle[.kts]` or `gradlew`) means Gradle.
+`jv` picks the build system for you: a `pom.xml` means Maven; otherwise a Gradle build
+(`build.gradle[.kts]`, `settings.gradle[.kts]` or `gradlew`, in the directory or an ancestor) means Gradle.
+Any other goal, plugin or flag is passed to the real tool untouched.
 
 ## Maven projects
 
 ### Done natively
-- **Dependency resolution** with full Maven semantics: parent POMs, `${}` interpolation (including inside
-  property values), `dependencyManagement` (with spec-compliant exclusion handling), BOM imports, exclusions,
-  optional dependencies, scope mediation (widened scopes widen transitive children), nearest-wins conflicts,
-  version ranges, and exact port of Maven's `ComparableVersion` ordering.
+
+- **Dependency resolution** with Maven semantics: parent POMs, `${}` interpolation (including inside
+  property values), `dependencyManagement`, BOM imports, exclusions, optional dependencies, scope mediation
+  (a widened scope also widens the transitive children), nearest-wins conflicts, version ranges, and an
+  exact port of Maven's `ComparableVersion` ordering.
 - **Profiles**: `-P`/`-P!id`, `activeByDefault`, and activation by property, `<jdk>`, `<os>` and `<file>`;
-  modules declared inside profiles are integrated into the reactor.
+  modules declared inside profiles are part of the reactor.
 - **Remote `-SNAPSHOT` dependencies** (unique and non-unique layouts); `-U` re-checks them.
-- **Multi-module reactors** in dependency topological order; siblings resolve to their build output. `-pl a,b`
-  builds the named modules plus required siblings (with parallel execution support).
-- **Resource filtering & syncing**: Property substitution (`${property}`) in non-binary resources, and automatic
-  tracking/removal of deleted resources from `src/*/resources` in the output directory.
-- **Plugin support natively**:
-  - `spring-boot-maven-plugin`: `repackage` goal creates executable fat-jars with `BOOT-INF/classes`,
-    `BOOT-INF/lib`, and Spring Boot launcher manifests.
-  - `maven-shade-plugin`: Fat-jar assembly, package relocation, and resource transformers (appending `META-INF/services`, etc.).
-  - `flatten-maven-plugin`: Generates clean flattened POMs (`.flattened-pom.xml`) for publication.
-  - `maven-enforcer-plugin` & `jacoco-maven-plugin`: Basic verification and execution hooks.
-  - Subprocess plugin API: Extensible JSON-RPC protocol for external plugin integration.
-- **Configuration & Workspace**:
-  - `jv.toml`: Project-level configuration to override compiler options, JVM arguments, and flags.
-  - `jv-workspace.toml`: Workspace configuration for multi-repo environments.
-- **`clean` in any position**: Leading `clean` uses a zero-network fast path; `clean` anywhere else runs at its
-  scheduled position in the goal sequence.
-- **`~/.m2/settings.xml`**: Mirrors, credentials, `localRepository`, active profiles, proxies, and SHA-1 verification.
-  Encrypted server passwords (`{...}`) are decrypted using `~/.m2/settings-security.xml`.
-- **Compiler & Testing**:
-  - Persistent `javac` worker daemon for instant compilation.
-  - ABI fingerprinting to prevent unnecessary rebuilds across modules.
-  - `maven-compiler-plugin` `<release>`, `<source>`, `<target>`, `<encoding>`, and compiler arguments.
-  - Annotation processor classpath support on modern JDKs (`-proc:full`).
-  - `maven-surefire-plugin`: Ant glob includes/excludes, JUnit tag filtering (`groups`/`excludedGroups`),
-    `-Dtest=...` filtering, `<argLine>`, and `<systemPropertyVariables>`. XML test reports generated in `target/surefire-reports`.
-- **Flags**: `-DskipTests`, `-Dmaven.test.skip`, `-Dtest=...`, `-Dmaven.test.failure.ignore=true`, `-o` (offline),
-  `-q` (quiet), `-X` (debug/verbose).
+- **Multi-module reactors**: independent modules compile in parallel (one worker per CPU, or `JV_JOBS`),
+  in dependency order. Tests, packaging and `install` then run one module at a time, like Maven, so tests
+  of different modules never overlap. Siblings resolve to their build output. `-pl a,b` builds the named modules plus the
+  siblings they need (so `-am` is accepted and ignored) and `clean` with `-pl` cleans only those modules.
+- **`clean` in any position**: a leading `clean` takes a fast path that needs no network or POM resolution; a
+  `clean` anywhere else (`jv install clean`) runs at its position in the goal list.
+- **`~/.m2/settings.xml`**: mirrors, credentials, `localRepository`, `<profiles>` (repositories and
+  properties), `<proxies>`; POM-declared repositories; SHA-1 verification. Encrypted server passwords
+  (`{...}`) are decrypted with the master password in `~/.m2/settings-security.xml`.
+- **Build steps**: resource copying that also removes resources you deleted from `src/*/resources`, skip-if-
+  unchanged `javac`, JUnit Platform tests (the launcher is fetched automatically; XML reports go to
+  `target/surefire-reports`), jars with directory entries, and `install` into the local repository.
+- **Per-project overrides** in a `jv.toml` ([see below](#project-settings-jvtoml)).
+- **Compiler settings**: `maven.compiler.*` properties and `maven-compiler-plugin` `<release>`, `<source>`,
+  `<target>`, `<encoding>`. Annotation processors on the classpath keep working on javac 23+ (jv passes
+  `-proc:full` on javac 21+).
+- **Plugin management**: `<pluginManagement>` entries for `maven-compiler-plugin`, `maven-surefire-plugin`
+  and `maven-jar-plugin` are read, because Maven applies them to the default lifecycle without the plugin
+  being declared.
+- **Test selection (`maven-surefire-plugin`)**: `<includes>`/`<excludes>` (Ant globs such as `**/*IT.java`),
+  `<groups>`/`<excludedGroups>` (JUnit tags), `<argLine>` and `<systemPropertyVariables>`. `-Dtest=...`
+  overrides includes/excludes, as in Surefire.
+- **Flags**: `-DskipTests`, `-Dmaven.test.skip`, `-Dtest=...`, `-Dmaven.test.failure.ignore=true`, `-o`
+  (offline), `-q` (quiet), `-X` (verbose). `-B -e -ntp -V -am` are accepted and ignored.
 
 ### Delegated to `mvn`
-- Specialized plugins with custom life-cycle bindings not handled natively.
-- Packagings other than `jar` and `pom` (e.g. `war`, `ear`, `maven-plugin`).
-- Complex custom plugin executions outside supported plugin goals.
+
+- Plugins and any goal that isn't in the list above; packagings other than `jar`/`pom` (war, ear,
+  maven-plugin, ...); projects without a readable `pom.xml`.
+- Any flag jv doesn't know (`-T`, `-f`, ...).
+- POMs, including inherited parent POMs, that customise the build in ways jv doesn't reproduce by default:
+  - `sourceDirectory` / `testSourceDirectory`, `finalName`;
+  - non-default or filtered `resources` / `testResources`;
+  - compiler configuration other than release/source/target/encoding (`compilerArgs`,
+    `annotationProcessorPaths`, ...);
+  - surefire configuration beyond the list above (`forkCount`, `parallel`, ...), `%regex[...]` / `%ant[...]`
+    test patterns, and an `<argLine>` that uses `@{...}` late binding (jacoco);
+  - **any plugin `<executions>`** (shade, spring-boot repackage, flatten, jacoco, enforcer, ...).
+
+  jv prints which setting caused the delegation.
+
+### Experimental native plugins (opt-in)
+
+jv contains native implementations for a few common plugins: `spring-boot-maven-plugin` (`repackage`),
+`maven-shade-plugin` (fat jars, relocation, resource merging), `flatten-maven-plugin`,
+`maven-enforcer-plugin`, `jacoco-maven-plugin`, plus resource filtering with property interpolation and
+generator hooks. Because they are not yet checked against Maven as thoroughly as the core build, builds that
+declare them are **delegated to `mvn` by default**.
+
+To run them natively, set `JV_IGNORE_BUILD_CONFIG=1`. jv then builds natively even when the POM has settings
+it doesn't reproduce, and prints a warning naming them:
+
+```sh
+JV_IGNORE_BUILD_CONFIG=1 jv package
+```
+
+Compare the result with `mvn package` before trusting it, especially for fat jars.
 
 ## Gradle projects
 
-- **Static Kotlin DSL Analyzer (`ktsparse`)**:
-  Fast, native static parser for `build.gradle.kts` files that extracts dependencies, plugins, and source sets
-  instantly without starting a JVM or Gradle daemon.
-- **Model Oracle**:
-  For complex builds, queries Gradle once (using wrapper if present) for a complete model, caches it in
-  `.jv/gradle-model.json` keyed by build scripts and properties, and compiles/tests natively on subsequent runs.
-- **Native Execution**: `clean`, `compile`, `test`, `package`, and `classpath`.
-- **Bridge Translation**: Delegated goals are translated accurately (`compile`→`classes`, `test`→`test`,
-  `package`→`build`, `install`→`publishToMavenLocal`, `tree`→`dependencies`, `-DskipTests`→`-x test`).
-- **Safety**: Safe path guards prevent accidental deletion of source directories during clean.
+jv does not re-implement the Groovy/Kotlin DSL. It asks a real Gradle (the wrapper if present) **once** for a
+JSON model through an init script (source dirs, resolved compile/runtime/test classpaths, javac and test
+settings), caches it in `.jv/gradle-model.json` keyed by the build scripts, `gradle.properties`, version
+catalogs and `-P/-D` arguments, then compiles, tests and packages natively. Later runs do not start Gradle at
+all until those inputs change.
 
-## Developer Experience Commands
+- **Native**: `clean`, `compile`, `test`, `package` (like `build`: it runs the tests), `classpath`.
+  `classpath` names exactly one project (`-pl`, or the project you are in).
+- **Through Gradle** (the bridge): everything else, and any build the model flags as not reproducible
+  (Kotlin/Groovy/Scala, war, annotation processors, several source dirs, TestNG, extra tasks wired into
+  `compileJava`, non-core plugins, a project-level dependency cycle). `JV_GRADLE_ORACLE=0` always uses the
+  bridge; `JV_IGNORE_BUILD_CONFIG=1` builds natively despite the warnings.
+- **Bridge translation**: `compile`→`classes`, `test`→`test`, `package`→`build`, `install`→`publishToMavenLocal`,
+  `tree`→`dependencies`, `-DskipTests`→`-x test`, `-o`→`--offline`, `-X`→`--info`,
+  `-pl a,b`→`:a:<task> :b:<task>`; `-s settings.xml` is dropped (it has no Gradle equivalent). Gradle's exit
+  code is returned unchanged.
+- **Safety**: `jv clean` refuses to delete a build directory that is, or contains, the project or its sources
+  (a script can set `buildDir = projectDir`); nothing is deleted if any target looks wrong.
 
-- **`jv init`**: Scaffolds a new Java project or creates a `jv.toml` configuration in an existing project.
-- **`jv audit`**: Scans resolved project dependencies against known vulnerability advisories.
-- **`jv upgrade`**: Checks for newer versions of dependencies, plugins, and build wrappers.
-- **`jv explain <dep>`**: Traces and visualizes why a specific dependency is present in the dependency tree.
+## Dependency tools
 
-## Caching & Performance
+These read the resolved dependency graph of a Maven project (they need a `pom.xml`) and never build anything.
 
-- **Persistent Javac Worker**: Reuses in-memory compiler instances to eliminate JVM startup overhead.
-- **ABI Fingerprinting**: Analyzes class signatures to avoid recompiling downstream modules when only private implementation details change.
-- **Content-Addressable Cache (CAS)**: Deduplicates dependencies and build artifacts locally.
-- **Distributed Cache Server (`jv-cache`)**: Run `jv-cache -addr :8080` to share build artifacts across machines and CI agents.
+**`jv explain <dependency>`** shows every path to a dependency in the resolved tree, then everything that
+declares it and which version each one asked for. That makes version conflicts that Maven's "nearest wins"
+rule hides easy to spot. The argument is `artifactId`, `groupId:artifactId` or `groupId:artifactId:version`.
 
-## Environment Variables
+```console
+$ jv explain libc
+demo:app:1.0
+  org.acme:liba:1.0 -> org.acme:libc:1.0
+  declared by:
+    org.acme:liba:1.0 wants 1.0
+    org.acme:libb:1.0 wants 2.0
+```
+
+**`jv audit`** looks every resolved artifact up in the [OSV](https://osv.dev) database and prints findings
+by severity (CVSS v3 scores are computed when an advisory has no label). It exits `0` when clean, `1` when
+there are findings and `2` when the audit itself could not run (offline, API down), so a failed audit never
+looks like a clean one. `-Daudit.failOn=high` only fails on HIGH or CRITICAL, `-Daudit.failOn=none` never
+fails, `-Daudit.json=true` prints JSON. `JV_OSV_URL` points at a mirror. `-SNAPSHOT` and unversioned artifacts
+are skipped.
+
+**`jv upgrade`** lists direct dependencies that have a newer release, from the repositories'
+`maven-metadata.xml`: `org.acme:liba 1.0 -> 2.0.0 (major)`. Pre-releases are not offered unless you are on
+one, `-jre`/`-android` style variants are kept, and artifacts that are in no repository are skipped.
+`-Dupgrade.all=true` includes transitive dependencies. It only reports; it never edits your POM.
+
+**`jv init`** creates `pom.xml`, a sample class and test, and a `.gitignore` in the current directory
+(`-DartifactId` defaults to the directory name). It refuses to run if a `pom.xml` or Gradle build is already
+there and never overwrites anything.
+
+## Project settings: jv.toml
+
+An optional `jv.toml` next to a module's `pom.xml` overrides POM settings for jv without touching the POM:
+
+```toml
+[build]
+release = 21            # javac --release (also: source, encoding)
+
+[test]
+includes = ["**/*Test.java", "**/*IT.java"]
+excludes = ["**/Slow*.java"]
+groups = "fast"         # JUnit tags to run     (also: excludedGroups)
+argLine = "-Xmx1g"      # JVM arguments for the test run
+```
+
+Settings in `jv.toml` win over the POM, and `-D` on the command line wins over both. Unknown keys produce a
+warning (so typos don't pass silently) and a syntax error stops the build with the line number. `[[plugin]]`
+and `[[generator]]` tables are recognised but **not run yet**; jv stops with an error instead of silently
+skipping them. `jv.toml` is ignored when a build is delegated to `mvn` (jv says so), and it does not apply to
+Gradle projects.
+
+## Shared cache
+
+Set `JV_CACHE_URL` to share downloaded artifacts between machines or CI jobs through a `jv-cache` server:
+
+```sh
+jv-cache -dir /var/cache/jv -addr :8080 -token s3cret        # on the cache host
+JV_CACHE_URL=http://cache.internal:8080 JV_CACHE_TOKEN=s3cret jv test
+```
+
+jv asks the cache before downloading an artifact and uploads what it downloaded. The cache can't poison a
+build: entries are keyed by the SHA-256 of the checksum the origin repository publishes, and a cached file is
+only used when its own SHA-1 matches that checksum (otherwise jv downloads it normally). Artifacts without a
+published checksum are never shared. A cache that is down or slow only costs a download. Use `https` (or a
+trusted network): the token and traffic are not protected over plain `http`, and jv warns when you do.
+
+## Editor integration
+
+`jv lsp` runs a small server over stdin/stdout for editors and scripts. It reads one JSON request per line
+and writes one JSON response per line (`{"result": ...}` or `{"error": "..."}`):
+
+```console
+$ echo '{"method":"projectInfo","params":{}}' | jv lsp
+{"result":{"artifact":"hello","group":"demo","modules":[{"group":"demo","artifact":"hello","version":"1.0","dir":"/work/hello"}],"version":"1.0"}}
+```
+
+| Method | Params | Result |
+|---|---|---|
+| `classpath` | `{"scope": "compile" \| "runtime" \| "test"}` (default `test`) | `{"classpath": [...]}` (`null` when the project has no dependencies) |
+| `sourceRoots` | none | `{"main": [...], "test": [...]}` |
+| `projectInfo` | none | `{"group", "artifact", "version", "modules": [...]}` |
+
+Resolution is cached and refreshed automatically when a module's `pom.xml` changes.
+
+## Repositories and security
+
+- Credentials from `settings.xml` are only sent to Maven Central, settings mirrors, and repositories declared
+  in the project's own POMs, never to repositories that only a dependency's POM declared.
+- Plain-`http` repositories declared in POMs are ignored (as in Maven 3.8.1+); `localhost` is allowed and an
+  `http` mirror configured in `settings.xml` is honoured.
+- Downloads are verified against the repository's `.sha1` when it provides one (`-X` shows artifacts that
+  couldn't be verified). That detects corruption, not a malicious repository; `JV_REQUIRE_CHECKSUMS=1`
+  refuses artifacts without a checksum.
+- **Encrypted passwords**: a server `<password>` of the form `{...}` is decrypted with the master password
+  from `~/.m2/settings-security.xml` (itself encrypted, as written by `mvn --encrypt-master-password`). If
+  decryption fails at build time jv warns once and sends **no** credentials rather than a wrong password. The
+  decrypted password lives in memory only and is never logged.
+
+## Environment
 
 | Variable | Meaning |
 |---|---|
-| `JV_REPO` | Local Maven repository directory (overrides `settings.xml`) |
-| `JV_JUNIT_VERSION` | JUnit platform standalone launcher version (default `1.10.2`) |
-| `JV_IGNORE_BUILD_CONFIG` | Build natively even if unsupported plugins or settings are present |
-| `JV_GRADLE_ORACLE` | `0` = disable native Gradle oracle; always delegate to Gradle CLI |
-| `JV_REQUIRE_CHECKSUMS` | Refuse artifacts that do not have `.sha1` checksums |
-| `JAVA_HOME` | JDK used for `javac`/`java` execution |
+| `JV_REPO` | local repository (overrides `settings.xml`; relative paths are resolved at startup) |
+| `JV_JUNIT_VERSION` | `junit-platform-console-standalone` version to fetch (default `1.10.2`) |
+| `JV_IGNORE_BUILD_CONFIG` | build natively even if the POM/Gradle model has settings jv doesn't reproduce (also enables the [experimental plugins](#experimental-native-plugins-opt-in)) |
+| `JV_GRADLE_ORACLE` | `0` = never use the native Gradle path, always run Gradle itself |
+| `JV_REQUIRE_CHECKSUMS` | refuse artifacts whose repository provides no `.sha1` |
+| `JV_JOBS` | number of modules compiled at once in a multi-module build (default: one per CPU) |
+| `JV_CACHE_URL` / `JV_CACHE_TOKEN` | [shared cache](#shared-cache) server and its bearer token |
+| `JV_OSV_URL` | OSV API base URL used by `jv audit` (default `https://api.osv.dev`) |
+| `JV_JAVAC_WORKER` | `1` = compile through a persistent `javac` worker process (experimental, off by default; it helps repeated compiles in one session and costs a JVM start otherwise; falls back to plain `javac` if it can't start) |
+| `JAVA_HOME` | JDK used for `javac`/`java` (wins over `PATH`, like Maven and Gradle) |
+
+## Known limitations
+
+- `-f`/`--file` is not handled natively (it is delegated to `mvn`); a non-default POM is only supported as a
+  `<module>` entry.
+- Password decryption reads `~/.m2/settings-security.xml` only and covers server passwords, not proxy
+  passwords.
+- Surefire: only Ant-style `includes`/`excludes`; a pattern without a leading `**/` matches the default
+  package only (as in Surefire). An `<argLine>` that still contains `${...}` after interpolation drops those
+  tokens.
+- Compilation is whole-module, not per-class.
+- Independent modules compile in parallel, so compiler output and log lines of different modules can
+  interleave; tests, packaging and `install` run one module at a time in dependency order (like Maven).
+  Results are the same for successful builds; failure behaviour can differ slightly.
+- TestNG is not supported natively; test discovery uses JUnit Platform engines found on the classpath.
+- Classpath order follows Maven's tree order but is not guaranteed identical in every edge case (the set of
+  jars is).
+
+## Roadmap
+
+These pieces exist in the repository but are **not connected to the `jv` command yet**, so don't rely on them:
+
+- `[[plugin]]` and `[[generator]]` in `jv.toml`: a subprocess plugin protocol exists (`plugin/`), but plugins
+  are not downloaded and nothing runs them; generators are not run either (jv refuses such a `jv.toml`).
+- `jv-workspace.toml` (`model/`): parsed, never used.
+- A static `build.gradle.kts` parser (`gradle/ktsparse`) to avoid starting Gradle at all.
+- A local content-addressable artifact store (`resolver/cacache.go`).
+- Running the experimental plugins natively by default, once they are covered by Maven-parity tests.
+
+## Benchmarking
+
+`./bench.sh` times jv against `mvn`, `mvnd` and Gradle on a generated project or one of your own:
+
+```sh
+./bench.sh --jv ./jv --runs 7 --warmup 2 --out bench-results.md
+./bench.sh --project path/to/your/project --no-gradle
+```
+
+See `./bench.sh` (the header comment) for all options. Speed-ups depend heavily on the project and on how
+much of it builds natively, so measure your own.
 
 ## Testing
 
-Run the comprehensive test suite with `./test-all.sh` (see `--help`):
+`./test-all.sh` is the single entry point (see `--help`):
 
-| Tier | Description |
+| Tier | What runs |
 |---|---|
-| `--quick` | Unit tests, static analysis (`gofmt`, `go vet`), and cross-compilation across platforms. |
-| default | Quick tests plus end-to-end integration scenarios, Maven parity checks, reactor builds, and Gradle stub/real scenarios. |
-| `--full` | Complete suite including heavy dependency graphs (Hadoop, Hibernate, Netty, AWS SDK) and real open-source corpus parity. |
-| `--corpus-only` | Parity checks on real open-source repositories (`commons-lang`, `commons-io`, `jackson`, `gson`, etc.). |
+| `--quick` | gofmt, `go vet`, `go test -race`, cross-compiles for linux/darwin/windows (no network) |
+| default | quick + end-to-end scenarios against Maven Central: incremental builds, tests passing/failing, scopes, exclusions, profiles, reactor builds, `install`, offline mode, delegation, and Gradle (with a stub `gradle`, plus a real-Gradle run when Gradle is installed) |
+| `--full` | default + heavier dependency graphs (hadoop, hibernate, netty, aws sdk) + a corpus of real open-source projects |
+| `--corpus-only` | just the corpus |
+
+If `mvn` is installed, every classpath check also diffs `jv` against `mvn dependency:build-classpath` for the
+compile, runtime and test scopes, and the corpus compares compile output with Maven's. That parity check is
+the real definition of "correct" for this tool. `--corpus-file FILE` takes
+`name|git url|ref|subdir|cp|build` lines.
 
 ## Contributing
 
-Bug reports and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Please run
-`./test-all.sh --quick` before submitting changes.
+Bug reports and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Run
+`./test-all.sh --quick` before sending a change, and `./test-all.sh` for anything that affects resolution or
+builds. Report security problems privately (see [SECURITY.md](SECURITY.md)).
 
 ## License
 

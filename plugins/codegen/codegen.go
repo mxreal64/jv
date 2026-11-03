@@ -46,6 +46,9 @@ func Run(ctx context.Context, g Generator, bc *lifecycle.BuildContext) error {
 	var inputFiles []any
 	for _, in := range g.Inputs {
 		expIn := string(compiler.SubstituteProperties([]byte(in), bc.Props))
+		if !filepath.IsAbs(expIn) && bc.Dir != "" {
+			expIn = filepath.Join(bc.Dir, expIn) // globs are relative to the module, not the process
+		}
 		matches, _ := filepath.Glob(expIn)
 		for _, m := range matches {
 			inputFiles = append(inputFiles, m)

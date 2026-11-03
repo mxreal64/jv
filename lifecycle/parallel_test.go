@@ -6,6 +6,7 @@ package lifecycle
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -67,7 +68,8 @@ func TestRunReactor_ParallelIndependent(t *testing.T) {
 		return lc
 	}
 
-	err := RunReactor(context.Background(), modules, "compile", buildLC, nil)
+	// explicit worker count: the test must not depend on the CPU count of the machine
+	err := RunReactorN(context.Background(), modules, "compile", buildLC, nil, 3)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -181,5 +183,75 @@ func TestRunReactor_SequentialNonCompilePhases(t *testing.T) {
 
 	if overlapped {
 		t.Errorf("package phase should run sequentially, but overlapped execution detected")
+	}
+}
+
+func TestRunGraph_DetectsCycle(t *testing.T) {
+	a := makeMockModule("a", "b")
+	b := makeMockModule("b", "a")
+	err := RunGraph(context.Background(), []*resolver.Module{a, b}, 2, func(context.Context, *resolver.Module) error { return nil })
+	if err == nil {
+		t.Fatal("expected a cycle error")
+	}
+}
+
+func TestRunGraph_RespectsWorkerLimit(t *testing.T) {
+	var mods []*resolver.Module
+	for _, n := range []string{"a", "b", "c", "d", "e", "f"} {
+		mods = append(mods, makeMockModule(n))
+	}
+	var running, peak int32
+	err := RunGraph(context.Background(), mods, 2, func(context.Context, *resolver.Module) error {
+		cur := atomic.AddInt32(&running, 1)
+		for {
+			p := atomic.LoadInt32(&peak)
+			if cur <= p || atomic.CompareAndSwapInt32(&peak, p, cur) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		atomic.AddInt32(&running, -1)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if peak != 2 {
+		t.Errorf("expected exactly 2 modules at a time, peak was %d", peak)
+	}
+}
+
+func TestDefaultWorkersHonoursJVJobs(t *testing.T) {
+	t.Setenv("JV_JOBS", "7")
+	if n := DefaultWorkers(); n != 7 {
+		t.Errorf("JV_JOBS=7 gave %d workers", n)
+	}
+	t.Setenv("JV_JOBS", "nonsense")
+	if n := DefaultWorkers(); n < 1 {
+		t.Errorf("invalid JV_JOBS must fall back to the CPU count, got %d", n)
+	}
+}
+
+func TestRunAfterContinuesWhereRunUpToStopped(t *testing.T) {
+	var order []string
+	lc := New()
+	for _, ph := range []Phase{"compile", "test-compile", "test", "package"} {
+		ph := ph
+		lc.Add(FuncExecutor{PhaseVal: ph, IDVal: string(ph), Fn: func(context.Context, BuildContext) error {
+			order = append(order, string(ph))
+			return nil
+		}})
+	}
+	if err := lc.RunUpTo(context.Background(), "test-compile", BuildContext{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := lc.RunAfter(context.Background(), "test-compile", "package", BuildContext{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(order, ","); got != "compile,test-compile,test,package" {
+		t.Errorf("phases ran as %s", got)
+	}
+	if err := lc.RunAfter(context.Background(), "nonsense", "package", BuildContext{}); err == nil {
+		t.Error("an unknown phase must be rejected")
 	}
 }

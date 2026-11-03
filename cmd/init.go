@@ -4,13 +4,24 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
 
+// ErrProjectExists is returned by InitProject when dir already contains a Maven or Gradle build.
+var ErrProjectExists = errors.New("a build file already exists here")
+
+// InitProject scaffolds a minimal Maven project in dir. It never overwrites an existing build:
+// if dir already has a pom.xml or a Gradle build it returns ErrProjectExists and writes nothing.
 func InitProject(dir, group, artifact, version, projType string) error {
+	for _, f := range []string{"pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); err == nil {
+			return fmt.Errorf("%w: %s", ErrProjectExists, f)
+		}
+	}
 	if group == "" {
 		group = "com.example"
 	}

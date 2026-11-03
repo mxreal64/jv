@@ -4,29 +4,45 @@
 package cmd
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-func TestInitProject(t *testing.T) {
+func TestInitProjectCreatesAProject(t *testing.T) {
 	dir := t.TempDir()
-	if err := InitProject(dir, "com.mycorp", "testapp", "1.0.0", "standard"); err != nil {
-		t.Fatalf("InitProject failed: %v", err)
+	if err := InitProject(dir, "org.acme", "demo", "1.2", ""); err != nil {
+		t.Fatal(err)
 	}
-
-	pomPath := filepath.Join(dir, "pom.xml")
-	if _, err := os.Stat(pomPath); err != nil {
-		t.Errorf("pom.xml missing")
+	pom, err := os.ReadFile(filepath.Join(dir, "pom.xml"))
+	if err != nil || !strings.Contains(string(pom), "<artifactId>demo</artifactId>") || !strings.Contains(string(pom), "<version>1.2</version>") {
+		t.Fatalf("pom.xml: %v\n%s", err, pom)
 	}
-
-	srcFile := filepath.Join(dir, "src/main/java/com/mycorp/App.java")
-	if _, err := os.Stat(srcFile); err != nil {
-		t.Errorf("App.java missing at %s", srcFile)
+	for _, f := range []string{"src/main/java/org/acme/App.java", "src/test/java/org/acme/AppTest.java", ".gitignore"} {
+		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(f))); err != nil {
+			t.Errorf("missing %s", f)
+		}
 	}
+}
 
-	testFile := filepath.Join(dir, "src/test/java/com/mycorp/AppTest.java")
-	if _, err := os.Stat(testFile); err != nil {
-		t.Errorf("AppTest.java missing at %s", testFile)
+// init must never destroy an existing build.
+func TestInitProjectRefusesToOverwrite(t *testing.T) {
+	for _, existing := range []string{"pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle"} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, existing), []byte("keep me"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := InitProject(dir, "g", "a", "1", "")
+		if !errors.Is(err, ErrProjectExists) {
+			t.Errorf("%s: want ErrProjectExists, got %v", existing, err)
+		}
+		if b, _ := os.ReadFile(filepath.Join(dir, existing)); string(b) != "keep me" {
+			t.Errorf("%s was modified", existing)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "src")); err == nil {
+			t.Errorf("%s: nothing may be written when init refuses", existing)
+		}
 	}
 }

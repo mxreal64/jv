@@ -92,6 +92,21 @@ func (l *Lifecycle) Add(e Executor) {
 // in the order they were added. Stops and returns on the first error.
 // Returns an error if goal is not a known lifecycle phase.
 func (l *Lifecycle) RunUpTo(ctx context.Context, goal Phase, bc BuildContext) error {
+	return l.run(ctx, -1, goal, bc)
+}
+
+// RunAfter runs the executors of the phases after `after`, up to and including goal. Together,
+// RunUpTo(after) followed by RunAfter(after, goal) runs exactly what RunUpTo(goal) would, which
+// lets a build do the parallel-safe phases of many modules first and the rest one by one.
+func (l *Lifecycle) RunAfter(ctx context.Context, after, goal Phase, bc BuildContext) error {
+	a := IndexOf(after)
+	if a < 0 {
+		return fmt.Errorf("unknown lifecycle phase %q", after)
+	}
+	return l.run(ctx, a, goal, bc)
+}
+
+func (l *Lifecycle) run(ctx context.Context, after int, goal Phase, bc BuildContext) error {
 	target := IndexOf(goal)
 	if target < 0 {
 		return fmt.Errorf("unknown lifecycle phase %q", goal)
@@ -105,7 +120,7 @@ func (l *Lifecycle) RunUpTo(ctx context.Context, goal Phase, bc BuildContext) er
 		if ei < 0 {
 			ei = verifyIdx + 1 // unknown phases run after verify, before install
 		}
-		if ei > target {
+		if ei > target || ei <= after {
 			continue
 		}
 		if err := e.Run(ctx, bc); err != nil {
