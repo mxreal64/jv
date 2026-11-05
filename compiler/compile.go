@@ -61,25 +61,38 @@ func javacBinary() string {
 	return "javac"
 }
 
-// Compile compiles every .java under srcDir into outDir with javac. It is skipped
+// Compile compiles every .java under srcDir into outDir with javac (see CompileDirs for several roots). It is skipped
 // when sources, classpath, options and the build stamps of any classpath directories
 // (sibling modules, target/classes for tests) are unchanged since the last successful run.
 // Returns whether javac actually ran.
 func Compile(ctx context.Context, srcDir, outDir string, classpath []string, opt Options) (bool, error) {
+	return CompileDirs(ctx, []string{srcDir}, outDir, classpath, opt)
+}
+
+// CompileDirs is Compile over several source roots (the module's own plus generated ones). Roots
+// that do not exist are skipped, so a generator that has not produced anything yet is harmless.
+func CompileDirs(ctx context.Context, srcDirs []string, outDir string, classpath []string, opt Options) (bool, error) {
 	var files, metas []string
 	var newest time.Time
-	_ = filepath.WalkDir(srcDir, func(p string, d fs.DirEntry, err error) error {
-		if err == nil && !d.IsDir() && strings.HasSuffix(d.Name(), ".java") {
-			files = append(files, p)
-			if info, e := d.Info(); e == nil {
-				metas = append(metas, fmt.Sprintf("%s:%d:%d", p, info.Size(), info.ModTime().UnixNano()))
-				if info.ModTime().After(newest) {
-					newest = info.ModTime()
+	seenDir := map[string]bool{}
+	for _, srcDir := range srcDirs {
+		if srcDir == "" || seenDir[filepath.Clean(srcDir)] {
+			continue
+		}
+		seenDir[filepath.Clean(srcDir)] = true
+		_ = filepath.WalkDir(srcDir, func(p string, d fs.DirEntry, err error) error {
+			if err == nil && !d.IsDir() && strings.HasSuffix(d.Name(), ".java") {
+				files = append(files, p)
+				if info, e := d.Info(); e == nil {
+					metas = append(metas, fmt.Sprintf("%s:%d:%d", p, info.Size(), info.ModTime().UnixNano()))
+					if info.ModTime().After(newest) {
+						newest = info.ModTime()
+					}
 				}
 			}
-		}
-		return nil
-	})
+			return nil
+		})
+	}
 	if len(files) == 0 {
 		return false, nil
 	}

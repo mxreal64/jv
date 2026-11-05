@@ -3,7 +3,11 @@
 
 package lifecycle
 
-import "github.com/mxreal64/jv/pom"
+import (
+	"sync"
+
+	"github.com/mxreal64/jv/pom"
+)
 
 // BuildContext is everything an executor needs to know about the project being
 // built. It is constructed once per module in buildModule and passed to every
@@ -42,17 +46,75 @@ type BuildContext struct {
 	// local repository path
 	Repo string
 
-	// mutable: executors may append source roots (e.g. code generators)
+	// Source roots added by executors (code generators, plugins). Executors receive the context by
+	// value, so roots are also recorded in Roots, which every copy of the context shares: a root added in
+	// generate-sources is therefore seen by compile. Use AddSourceRoot rather than appending directly.
 	ExtraSourceRoots     []string
 	ExtraTestSourceRoots []string
+	Roots                *SourceRoots
 }
 
-// AllSourceDirs returns SourceDirs plus any ExtraSourceRoots added by prior executors.
+// SourceRoots is the set of generated source directories of one module build, shared by every copy of
+// its BuildContext.
+type SourceRoots struct {
+	mu         sync.Mutex
+	main, test []string
+}
+
+func (r *SourceRoots) add(dir string, test bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if test {
+		r.test = append(r.test, dir)
+	} else {
+		r.main = append(r.main, dir)
+	}
+}
+
+func (r *SourceRoots) snapshot(test bool) []string {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if test {
+		return append([]string(nil), r.test...)
+	}
+	return append([]string(nil), r.main...)
+}
+
+// AddSourceRoot registers a generated source directory so that later phases compile it.
+func (bc *BuildContext) AddSourceRoot(dir string, test bool) {
+	if test {
+		bc.ExtraTestSourceRoots = append(bc.ExtraTestSourceRoots, dir)
+	} else {
+		bc.ExtraSourceRoots = append(bc.ExtraSourceRoots, dir)
+	}
+	if bc.Roots != nil {
+		bc.Roots.add(dir, test)
+	}
+}
+
+func uniqueDirs(lists ...[]string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, l := range lists {
+		for _, d := range l {
+			if d != "" && !seen[d] {
+				seen[d] = true
+				out = append(out, d)
+			}
+		}
+	}
+	return out
+}
+
+// AllSourceDirs returns SourceDirs plus every source root added by executors.
 func (bc *BuildContext) AllSourceDirs() []string {
-	return append(append([]string{}, bc.SourceDirs...), bc.ExtraSourceRoots...)
+	return uniqueDirs(bc.SourceDirs, bc.ExtraSourceRoots, bc.Roots.snapshot(false))
 }
 
-// AllTestSourceDirs returns TestSourceDirs plus any ExtraTestSourceRoots.
+// AllTestSourceDirs returns TestSourceDirs plus every test source root added by executors.
 func (bc *BuildContext) AllTestSourceDirs() []string {
-	return append(append([]string{}, bc.TestSourceDirs...), bc.ExtraTestSourceRoots...)
+	return uniqueDirs(bc.TestSourceDirs, bc.ExtraTestSourceRoots, bc.Roots.snapshot(true))
 }

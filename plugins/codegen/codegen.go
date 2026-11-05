@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/mxreal64/jv/compiler"
 	"github.com/mxreal64/jv/lifecycle"
@@ -34,10 +36,17 @@ func Run(ctx context.Context, g Generator, bc *lifecycle.BuildContext) error {
 		expandedCmd[i] = string(compiler.SubstituteProperties([]byte(arg), bc.Props))
 	}
 
+	// Arguments such as src/main/proto/*.proto are expanded here, as a shell would; exec does not.
+	expandedCmd = expandGlobArgs(expandedCmd, bc.Dir)
+
 	outDir := g.OutputDir
 	if outDir != "" {
 		outDir = string(compiler.SubstituteProperties([]byte(outDir), bc.Props))
+		if !filepath.IsAbs(outDir) && bc.Dir != "" {
+			outDir = filepath.Join(bc.Dir, outDir)
+		}
 	}
+	isTest := g.Phase == "generate-test-sources"
 
 	// Incremental check
 	stateFile := filepath.Join(bc.TargetDir, ".jv", fmt.Sprintf("gen-%s.state", g.ID))
@@ -61,11 +70,7 @@ func Run(ctx context.Context, g Generator, bc *lifecycle.BuildContext) error {
 		// Output dir exists and inputs unchanged
 		if outDir != "" {
 			if st, err := os.Stat(outDir); err == nil && st.IsDir() {
-				if g.Phase == "generate-test-sources" {
-					bc.ExtraTestSourceRoots = append(bc.ExtraTestSourceRoots, outDir)
-				} else {
-					bc.ExtraSourceRoots = append(bc.ExtraSourceRoots, outDir)
-				}
+				bc.AddSourceRoot(outDir, isTest)
 				return nil
 			}
 		}
@@ -87,12 +92,40 @@ func Run(ctx context.Context, g Generator, bc *lifecycle.BuildContext) error {
 	_ = inc.Done(inputFiles...)
 
 	if outDir != "" {
-		if g.Phase == "generate-test-sources" {
-			bc.ExtraTestSourceRoots = append(bc.ExtraTestSourceRoots, outDir)
-		} else {
-			bc.ExtraSourceRoots = append(bc.ExtraSourceRoots, outDir)
-		}
+		bc.AddSourceRoot(outDir, isTest)
 	}
 
 	return nil
+}
+
+// expandGlobArgs replaces every argument that contains a glob pattern (and is not an option) with the
+// files it matches, relative to dir. A pattern that matches nothing is left as it is.
+func expandGlobArgs(args []string, dir string) []string {
+	if len(args) == 0 {
+		return args
+	}
+	out := []string{args[0]}
+	for _, a := range args[1:] {
+		if strings.HasPrefix(a, "-") || !strings.ContainsAny(a, "*?[") {
+			out = append(out, a)
+			continue
+		}
+		pattern := a
+		if !filepath.IsAbs(pattern) && dir != "" {
+			pattern = filepath.Join(dir, a)
+		}
+		matches, err := filepath.Glob(pattern)
+		if err != nil || len(matches) == 0 {
+			out = append(out, a)
+			continue
+		}
+		sort.Strings(matches)
+		for _, m := range matches {
+			if rel, err := filepath.Rel(dir, m); err == nil && dir != "" && !filepath.IsAbs(a) {
+				m = rel
+			}
+			out = append(out, m)
+		}
+	}
+	return out
 }

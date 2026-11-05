@@ -7,6 +7,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mxreal64/jv/lifecycle"
@@ -86,5 +87,17 @@ func TestGeneratorRunAndIncremental(t *testing.T) {
 	fi2, _ := os.Stat(genFile)
 	if !fi2.ModTime().Equal(fi.ModTime()) {
 		t.Fatalf("expected command not to be rerun when inputs are unchanged")
+	}
+}
+
+func TestExpandGlobArgs(t *testing.T) {
+	dir := t.TempDir()
+	for _, f := range []string{"a.proto", "b.proto", "c.txt"} {
+		_ = os.WriteFile(filepath.Join(dir, f), nil, 0o644)
+	}
+	got := expandGlobArgs([]string{"protoc", "--java_out=out", "*.proto", "*.none", "literal"}, dir)
+	want := []string{"protoc", "--java_out=out", "a.proto", "b.proto", "*.none", "literal"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("got %v, want %v", got, want)
 	}
 }

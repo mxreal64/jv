@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,6 +23,7 @@ import (
 	"github.com/mxreal64/jv/lifecycle"
 	"github.com/mxreal64/jv/model"
 	"github.com/mxreal64/jv/packager"
+	"github.com/mxreal64/jv/plugin"
 	"github.com/mxreal64/jv/plugins/codegen"
 	"github.com/mxreal64/jv/plugins/enforcer"
 	"github.com/mxreal64/jv/plugins/flatten"
@@ -494,6 +496,7 @@ func makeBuildContext(m *resolver.Module, arts []resolver.Artifact, loader *reso
 
 	abs := func(rel string) string { return filepath.Join(m.Dir, filepath.FromSlash(rel)) }
 	return lifecycle.BuildContext{
+		Roots:                 &lifecycle.SourceRoots{},
 		Group:                 m.Eff.G,
 		Artifact:              m.Eff.A,
 		Version:               m.Eff.V,
@@ -527,8 +530,23 @@ func buildLifecycle(
 	o *cliOpts,
 	mlog func(string, ...any),
 	jvTest model.TestConfig,
+	jvGenerators []model.GeneratorDecl,
+	jvPlugins []lifecycle.Executor,
 ) *lifecycle.Lifecycle {
 	lc := lifecycle.New()
+
+	// [[generator]] entries of jv.toml: external commands that write sources, which are then compiled.
+	for i, gd := range jvGenerators {
+		id, phase := generatorID(gd, i), generatorPhase(gd)
+		g := codegen.Generator{ID: id, Phase: phase, Command: gd.Command, OutputDir: gd.Output, Inputs: gd.Inputs}
+		lc.Add(lifecycle.FuncExecutor{PhaseVal: lifecycle.Phase(phase), IDVal: "jv.toml:" + id, Fn: func(ctx context.Context, bc lifecycle.BuildContext) error {
+			return codegen.Run(ctx, g, &bc)
+		}})
+	}
+	// [[plugin]] entries of jv.toml: installed external executables speaking jv's JSON protocol.
+	for _, e := range jvPlugins {
+		lc.Add(e)
+	}
 
 	// validate
 	lc.Add(lifecycle.FuncExecutor{PhaseVal: "validate", IDVal: "enforcer", Fn: func(ctx context.Context, bc lifecycle.BuildContext) error {
@@ -563,7 +581,9 @@ func buildLifecycle(
 				OutputDir: filepath.Join(bc.TargetDir, "generated-sources", "protobuf"),
 				Inputs:    []string{"src/main/proto/**/*.proto"},
 			}
-			_ = codegen.Run(ctx, g, &bc)
+			if err := codegen.Run(ctx, g, &bc); err != nil {
+				return err // a failed generator must stop the build, not leave its classes missing
+			}
 		}
 		return nil
 	}})
@@ -600,11 +620,7 @@ func buildLifecycle(
 	// compile
 	lc.Add(lifecycle.FuncExecutor{PhaseVal: "compile", IDVal: "compile", Fn: func(ctx context.Context, bc lifecycle.BuildContext) error {
 		opts := compiler.OptionsFrom(bc.Props)
-		var src string
-		if dirs := bc.AllSourceDirs(); len(dirs) > 0 {
-			src = dirs[0]
-		}
-		compiled, err := compiler.Compile(ctx, src, bc.ClassesDir, bc.CompileCP, opts)
+		compiled, err := compiler.CompileDirs(ctx, bc.AllSourceDirs(), bc.ClassesDir, bc.CompileCP, opts)
 		if err != nil {
 			return fmt.Errorf("compilation failed: %w", err)
 		}
@@ -635,12 +651,8 @@ func buildLifecycle(
 			return nil
 		}
 		opts := compiler.OptionsFrom(bc.Props)
-		var testSrc string
-		if dirs := bc.AllTestSourceDirs(); len(dirs) > 0 {
-			testSrc = dirs[0]
-		}
 		testCp := append([]string{bc.TestClassesDir, bc.ClassesDir}, bc.TestCP...)
-		tc, err := compiler.Compile(ctx, testSrc, bc.TestClassesDir, testCp, opts)
+		tc, err := compiler.CompileDirs(ctx, bc.AllTestSourceDirs(), bc.TestClassesDir, testCp, opts)
 		if err != nil {
 			return fmt.Errorf("test compilation failed: %w", err)
 		}
@@ -836,9 +848,12 @@ func prepareModule(ctx context.Context, loader *resolver.Loader, m *resolver.Mod
 	for _, w := range jt.Warnings {
 		mlog("warning: jv.toml: %s", w)
 	}
-	if len(jt.Plugins)+len(jt.Generators) > 0 {
-		return nil, fmt.Errorf("jv.toml declares [[plugin]] or [[generator]] entries, which jv does not run yet; " +
-			"remove them (or build this project with mvn) rather than have them silently skipped")
+	if err := validateGenerators(jt.Generators); err != nil {
+		return nil, fmt.Errorf("jv.toml: %w", err)
+	}
+	jvPlugins, err := preparePlugins(ctx, loader, jt.Plugins)
+	if err != nil {
+		return nil, fmt.Errorf("jv.toml: %w", err)
 	}
 
 	// Build effective props: POM props + plugin-management compiler overrides.
@@ -863,7 +878,7 @@ func prepareModule(ctx context.Context, loader *resolver.Loader, m *resolver.Mod
 	}
 
 	bc := makeBuildContext(m, arts, loader, effProps)
-	return &preparedModule{lc: buildLifecycle(ctx, loader, m, arts, o, mlog, jt.Test), bc: bc}, nil
+	return &preparedModule{lc: buildLifecycle(ctx, loader, m, arts, o, mlog, jt.Test, jt.Generators, jvPlugins), bc: bc}, nil
 }
 
 // buildTargets builds the selected modules for one goal. Modules whose dependencies are done
@@ -925,6 +940,75 @@ func hasLauncher(arts []resolver.Artifact) bool {
 		}
 	}
 	return false
+}
+
+// preparePlugins validates the [[plugin]] entries of jv.toml and finds their installed executables. A
+// plugin that is not installed fails the build up front; jv does not download plugins.
+func preparePlugins(ctx context.Context, loader *resolver.Loader, decls []model.PluginDecl) ([]lifecycle.Executor, error) {
+	seen := map[string]bool{}
+	var out []lifecycle.Executor
+	for _, pd := range decls {
+		parts := strings.Split(pd.ID, ":")
+		switch {
+		case len(parts) != 2 || parts[0] == "" || parts[1] == "":
+			return nil, fmt.Errorf("[[plugin]] id %q must look like groupId:artifactId", pd.ID)
+		case pd.Version == "":
+			return nil, fmt.Errorf("[[plugin]] %s needs a version", pd.ID)
+		case lifecycle.IndexOf(lifecycle.Phase(pd.Phase)) < 0:
+			return nil, fmt.Errorf("[[plugin]] %s: phase %q is not a lifecycle phase (e.g. generate-sources, compile, package)", pd.ID, pd.Phase)
+		case seen[pd.ID+"@"+pd.Phase]:
+			return nil, fmt.Errorf("[[plugin]] %s is declared twice for phase %s", pd.ID, pd.Phase)
+		}
+		seen[pd.ID+"@"+pd.Phase] = true
+		desc, err := plugin.Resolve(ctx, pd.ID, pd.Version, loader)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, &plugin.PluginExecutor{
+			Descriptor: desc,
+			Req:        plugin.Request{Phase: pd.Phase, ID: pd.ID, Config: pd.Config},
+			Inputs:     pd.Inputs,
+		})
+	}
+	return out, nil
+}
+
+func generatorID(g model.GeneratorDecl, i int) string {
+	if g.ID != "" {
+		return g.ID
+	}
+	return fmt.Sprintf("generator-%d", i+1)
+}
+
+func generatorPhase(g model.GeneratorDecl) string {
+	if g.Phase != "" {
+		return g.Phase
+	}
+	return "generate-sources"
+}
+
+var generatorIDRE = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// validateGenerators checks [[generator]] entries up front so a typo fails the build with a clear
+// message instead of producing a project that compiles without its generated sources.
+func validateGenerators(gens []model.GeneratorDecl) error {
+	seen := map[string]bool{}
+	for i, g := range gens {
+		id := generatorID(g, i)
+		switch {
+		case !generatorIDRE.MatchString(id):
+			return fmt.Errorf("[[generator]] id %q may only contain letters, digits, '.', '_' and '-'", id)
+		case seen[id]:
+			return fmt.Errorf("[[generator]] id %q is used twice", id)
+		case len(g.Command) == 0:
+			return fmt.Errorf("[[generator]] %q needs a command", id)
+		}
+		if p := generatorPhase(g); p != "generate-sources" && p != "generate-test-sources" {
+			return fmt.Errorf("[[generator]] %q: phase must be generate-sources or generate-test-sources, got %q", id, p)
+		}
+		seen[id] = true
+	}
+	return nil
 }
 
 // applyJVTestConfig layers the [test] table of jv.toml over the surefire configuration of the POM:

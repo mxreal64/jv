@@ -93,6 +93,7 @@ func RunPlugin(ctx context.Context, binary string, req Request) (Response, error
 	} else {
 		cmd = exec.CommandContext(ctxTimeout, binary)
 	}
+	cmd.Dir = req.Context.Dir // plugins work relative to the module, not to wherever jv was started
 	var stdin bytes.Buffer
 	if err := json.NewEncoder(&stdin).Encode(req); err != nil {
 		return Response{}, fmt.Errorf("encoding request: %w", err)
@@ -119,6 +120,7 @@ func RunPlugin(ctx context.Context, binary string, req Request) (Response, error
 	}
 
 	scanner := bufio.NewScanner(&stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	if !scanner.Scan() {
 		return Response{}, io.EOF
 	}

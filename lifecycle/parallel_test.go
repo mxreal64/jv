@@ -255,3 +255,25 @@ func TestRunAfterContinuesWhereRunUpToStopped(t *testing.T) {
 		t.Error("an unknown phase must be rejected")
 	}
 }
+
+// Executors get the BuildContext by value; roots they add must still reach later phases.
+func TestSourceRootsAreSharedAcrossContextCopies(t *testing.T) {
+	bc := BuildContext{SourceDirs: []string{"src"}, TestSourceDirs: []string{"tsrc"}, Roots: &SourceRoots{}}
+	generate := func(bc BuildContext) { // an executor: a copy of the context
+		bc.AddSourceRoot("gen", false)
+		bc.AddSourceRoot("gen", false) // adding twice is harmless
+		bc.AddSourceRoot("tgen", true)
+	}
+	generate(bc)
+	if got := strings.Join(bc.AllSourceDirs(), ","); got != "src,gen" {
+		t.Errorf("source dirs = %s", got)
+	}
+	if got := strings.Join(bc.AllTestSourceDirs(), ","); got != "tsrc,tgen" {
+		t.Errorf("test source dirs = %s", got)
+	}
+	var plain BuildContext // no shared set: still usable, roots are just local
+	plain.AddSourceRoot("x", false)
+	if got := strings.Join(plain.AllSourceDirs(), ","); got != "x" {
+		t.Errorf("plain context = %s", got)
+	}
+}

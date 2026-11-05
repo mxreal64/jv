@@ -262,10 +262,49 @@ argLine = "-Xmx1g"      # JVM arguments for the test run
 ```
 
 Settings in `jv.toml` win over the POM, and `-D` on the command line wins over both. Unknown keys produce a
-warning (so typos don't pass silently) and a syntax error stops the build with the line number. `[[plugin]]`
-and `[[generator]]` tables are recognised but **not run yet**; jv stops with an error instead of silently
-skipping them. `jv.toml` is ignored when a build is delegated to `mvn` (jv says so), and it does not apply to
-Gradle projects.
+warning (so typos don't pass silently) and a syntax error stops the build with the line number. `jv.toml` is
+ignored when a build is delegated to `mvn` (jv says so), and it does not apply to Gradle projects.
+
+### Code generators
+
+A `[[generator]]` runs a command that writes Java sources; its output directory is compiled together with
+the module's own sources. The command runs in the module directory, `${property}` references and glob
+arguments such as `src/main/proto/*.proto` are expanded, and the generator is skipped when its command and
+`inputs` have not changed. A generator that fails stops the build.
+
+```toml
+[[generator]]
+id = "proto"                              # letters, digits, . _ -
+phase = "generate-sources"                # or generate-test-sources (the default is generate-sources)
+command = ["protoc", "--java_out=target/gen", "src/main/proto/*.proto"]
+output = "target/gen"                     # added as a source root
+inputs = ["src/main/proto/**/*.proto"]    # re-run when these change
+```
+
+### Plugins
+
+A `[[plugin]]` runs an installed executable at a lifecycle phase. jv writes one JSON line describing the module
+(directories, classpaths, properties) and your `config` table to its stdin, and reads one JSON line back:
+`{"sourceRoots": [...], "properties": {...}, "skip": false}`. Exit code 2 means "nothing to do". The plugin
+runs in the module directory; relative source roots are resolved against it. The plugin is skipped when its
+binary, `config`, phase and `inputs` have not changed, and its last source roots and properties are replayed
+so generated sources are never lost.
+
+```toml
+[[plugin]]
+id = "org.acme:schema-gen"                # groupId:artifactId
+version = "1.2"
+phase = "generate-sources"
+inputs = ["schema/*.json"]
+
+[plugin.config]
+package = "com.acme.model"
+```
+
+jv does not download plugins. Put the executable at `~/.jv/plugins/org.acme/schema-gen/1.2/plugin`
+(`plugin.exe` on Windows; set `JV_PLUGIN_DIR` to use another root). A declared plugin that is not installed
+fails the build and names the path it looked for. Plugins are programs you install and trust: they run with
+your permissions.
 
 ## Shared cache
 
@@ -323,6 +362,7 @@ Resolution is cached and refreshed automatically when a module's `pom.xml` chang
 | `JV_IGNORE_BUILD_CONFIG` | build natively even if the POM/Gradle model has settings jv doesn't reproduce (also enables the [experimental plugins](#experimental-native-plugins-opt-in)) |
 | `JV_GRADLE_ORACLE` | `0` = never use the native Gradle path, always run Gradle itself |
 | `JV_REQUIRE_CHECKSUMS` | refuse artifacts whose repository provides no `.sha1` |
+| `JV_PLUGIN_DIR` | root directory of installed [plugins](#plugins) (default `~/.jv/plugins`) |
 | `JV_JOBS` | number of modules compiled at once in a multi-module build (default: one per CPU) |
 | `JV_CACHE_URL` / `JV_CACHE_TOKEN` | [shared cache](#shared-cache) server and its bearer token |
 | `JV_OSV_URL` | OSV API base URL used by `jv audit` (default `https://api.osv.dev`) |
@@ -348,14 +388,15 @@ Resolution is cached and refreshed automatically when a module's `pom.xml` chang
 
 ## Roadmap
 
-These pieces exist in the repository but are **not connected to the `jv` command yet**, so don't rely on them:
+These pieces exist in the repository but are **not connected to the `jv` command**, so don't rely on them:
 
-- `[[plugin]]` and `[[generator]]` in `jv.toml`: a subprocess plugin protocol exists (`plugin/`), but plugins
-  are not downloaded and nothing runs them; generators are not run either (jv refuses such a `jv.toml`).
-- `jv-workspace.toml` (`model/`): parsed, never used.
-- A static `build.gradle.kts` parser (`gradle/ktsparse`) to avoid starting Gradle at all.
-- A local content-addressable artifact store (`resolver/cacache.go`).
-- Running the experimental plugins natively by default, once they are covered by Maven-parity tests.
+- `jv-workspace.toml` (`model/`): it parses a list of module directories, but what a workspace should do with
+  them (build each as its own project? share a cache?) has not been decided.
+- A static `build.gradle.kts` parser (`gradle/ktsparse`) to avoid starting Gradle at all. It cannot be made
+  to match Gradle's own resolution in general (version catalogs, convention plugins, variables), so it is not
+  used; jv asks Gradle once and caches the answer instead.
+- A local content-addressable artifact store (`resolver/cacache.go`); `~/.m2` already plays that role.
+- Running the experimental Maven plugins natively by default, once they are covered by Maven-parity tests.
 
 ## Benchmarking
 

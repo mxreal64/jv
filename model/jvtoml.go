@@ -41,6 +41,7 @@ type PluginDecl struct {
 	Version string                 `toml:"version"`
 	Phase   string                 `toml:"phase"`
 	Config  map[string]interface{} `toml:"config"`
+	Inputs  []string               `toml:"inputs"` // files the plugin reads (globs), for change detection
 }
 
 type GeneratorDecl struct {
@@ -86,10 +87,15 @@ func Load(dir string) (JVToml, error) {
 		d.checkKeys("test", t, "includes", "excludes", "groups", "excludedGroups", "argLine")
 	}
 	for _, t := range d.tables(doc, "plugin") {
-		res.Plugins = append(res.Plugins, PluginDecl{
+		pd := PluginDecl{
 			ID: d.str(t, "plugin", "id"), Version: d.str(t, "plugin", "version"), Phase: d.str(t, "plugin", "phase"),
-		})
-		d.checkKeys("plugin", t, "id", "version", "phase", "config")
+			Inputs: d.strs(t, "plugin", "inputs"),
+		}
+		if cfg, ok := d.table(t, "config"); ok {
+			pd.Config = cfg
+		}
+		res.Plugins = append(res.Plugins, pd)
+		d.checkKeys("plugin", t, "id", "version", "phase", "config", "inputs")
 	}
 	for _, t := range d.tables(doc, "generator") {
 		res.Generators = append(res.Generators, GeneratorDecl{
