@@ -20,6 +20,16 @@ jobs:
         with:
           distribution: temurin
           java-version: "${{ matrix.java }}"
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-build-deps-${{ hashFiles('**/pom.xml', '**/*.gradle*') }}
+          restore-keys: |
+            ${{ runner.os }}-build-deps-
       - run: test -z "$(gofmt -l .)"
         shell: bash
       - name: SPDX headers
@@ -28,7 +38,12 @@ jobs:
           missing="$(grep -rL 'SPDX-License-Identifier: GPL-3.0-only' --include='*.go' .)"
           if [ -n "$missing" ]; then echo "missing SPDX header:"; echo "$missing"; exit 1; fi
       - run: go vet ./...
-      - run: go test -race -count=1 ./...
+      - name: Unit and Parity Tests (Go)
+        run: go test -race -count=1 ./...
+      - name: Comprehensive End-to-End and Parity Suite
+        if: matrix.os == 'ubuntu-latest' && matrix.java == '17'
+        run: ./test-all.sh
+        shell: bash
   windows:
     runs-on: windows-latest
     steps:
