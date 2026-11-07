@@ -388,15 +388,8 @@ Resolution is cached and refreshed automatically when a module's `pom.xml` chang
 
 ## Roadmap
 
-These pieces exist in the repository but are **not connected to the `jv` command**, so don't rely on them:
-
-- `jv-workspace.toml` (`model/`): it parses a list of module directories, but what a workspace should do with
-  them (build each as its own project? share a cache?) has not been decided.
-- A static `build.gradle.kts` parser (`gradle/ktsparse`) to avoid starting Gradle at all. It cannot be made
-  to match Gradle's own resolution in general (version catalogs, convention plugins, variables), so it is not
-  used; jv asks Gradle once and caches the answer instead.
-- A local content-addressable artifact store (`resolver/cacache.go`); `~/.m2` already plays that role.
-- Running the experimental Maven plugins natively by default, once they are covered by Maven-parity tests.
+- Running experimental plugins natively by default, backed by comprehensive Maven and Gradle parity test suites.
+- Continued performance optimizations across incremental compilation and worker daemons.
 
 ## Benchmarking
 

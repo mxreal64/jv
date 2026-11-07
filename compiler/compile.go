@@ -120,7 +120,13 @@ func CompileDirs(ctx context.Context, srcDirs []string, outDir string, classpath
 		}
 	}
 
-	_ = os.RemoveAll(outDir) // drop stale classes from deleted sources
+	// drop stale classes from deleted sources without wiping resources
+	_ = filepath.WalkDir(outDir, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasSuffix(d.Name(), ".class") {
+			_ = os.Remove(p)
+		}
+		return nil
+	})
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return false, err
 	}

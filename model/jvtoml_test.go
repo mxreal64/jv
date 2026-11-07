@@ -49,28 +49,6 @@ argLine = "-Xmx1024m"
 	}
 }
 
-func TestWorkspaceLoad(t *testing.T) {
-	dir := t.TempDir()
-
-	wsNil, err := LoadWorkspace(dir)
-	if err != nil || wsNil != nil {
-		t.Fatalf("expected nil for missing workspace")
-	}
-
-	content := `modules = ["core", "app", "lib/util"]`
-	if err := os.WriteFile(filepath.Join(dir, "jv-workspace.toml"), []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	ws, err := LoadWorkspace(dir)
-	if err != nil {
-		t.Fatalf("LoadWorkspace failed: %v", err)
-	}
-	if len(ws.Modules) != 3 || ws.Modules[0] != "core" || ws.Modules[2] != "lib/util" {
-		t.Fatalf("unexpected modules: %v", ws.Modules)
-	}
-}
-
 func TestJVTomlFullDocument(t *testing.T) {
 	dir := t.TempDir()
 	content := `

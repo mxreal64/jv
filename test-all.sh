@@ -455,7 +455,7 @@ sc_reactor() {
   runjv "$d" -pl nope compile;             t_rcnz "-pl with unknown module fails"
   runjv "$d" classpath;                    t_rcnz "classpath at the aggregator needs -pl"
   runjv "$d" -q -pl app classpath test;    t_rc0 "-pl app classpath"; t_cp_has "sibling build output on classpath" "$LAST_OUT" 'util/target/classes'
-  sleep 1; echo "// edit" >>"$d/core/src/main/java/demo/Core.java"
+  sleep 1; sed -i 's/}$/public static void extra() {} }/' "$d/core/src/main/java/demo/Core.java"
   runjv "$d" compile
   t_out "edit in core rebuilds core" '\[core\] compiled main sources'; t_out "...and dependent util" '\[util\] compiled main sources'; t_out "...and dependent app" '\[app\] compiled main sources'
   runjv "$d" compile;                      t_noout "second run recompiles nothing" 'compiled main sources'
@@ -526,6 +526,42 @@ sc_fallback() {
   else
     skip "mvn delegation" "mvn not installed"
   fi
+}
+
+sc_parity_plugins() {
+  begin parity_plugins
+  local d="$WORK/plugin-shade"
+  newproj "$d" "<dependencies>$(dep commons-io commons-io 2.15.1)</dependencies>
+  <build><plugins><plugin>
+    <groupId>org.apache.maven.plugins</groupId><artifactId>maven-shade-plugin</artifactId><version>3.5.2</version>
+    <executions><execution><phase>package</phase><goals><goal>shade</goal></goals></execution></executions>
+  </plugin></plugins></build>"
+  cat >"$d/src/main/java/demo/App.java" <<'EOF'
+package demo;
+import org.apache.commons.io.IOUtils;
+public class App {
+    public static void main(String[] args) {
+        System.out.println("SHADED:" + IOUtils.class.getSimpleName());
+    }
+}
+EOF
+  JV_IGNORE_BUILD_CONFIG=1 runjv "$d" package
+  t_rc0 "shade packages natively"
+  t_file "fat jar built" "$d/target/app-1.0.jar"
+  jar tf "$d/target/app-1.0.jar" 2>/dev/null | grep -q 'org/apache/commons/io/IOUtils.class' \
+    && ok "$CUR: fat jar contains dependency classes" || bad "$CUR: fat jar lacks dependency classes"
+  [ "$(java -jar "$d/target/app-1.0.jar" 2>&1)" = "SHADED:IOUtils" ] \
+    && ok "$CUR: shaded jar executes cleanly" || bad "$CUR: shaded jar failed to execute"
+
+  # Flatten plugin parity
+  local f="$WORK/plugin-flatten"
+  newproj "$f" '<properties><revision>2.0.0-M1</revision></properties>
+  <build><plugins><plugin><artifactId>flatten-maven-plugin</artifactId><version>1.6.0</version></plugin></plugins></build>'
+  sed -i.bak 's#<version>1.0</version>#<version>${revision}</version>#' "$f/pom.xml" && rm -f "$f/pom.xml.bak"
+  JV_IGNORE_BUILD_CONFIG=1 runjv "$f" compile
+  t_file "flatten generated .flattened-pom.xml" "$f/.flattened-pom.xml"
+  grep -q '<version>2.0.0-M1</version>' "$f/.flattened-pom.xml" \
+    && ok "$CUR: .flattened-pom.xml resolved revision" || bad "$CUR: revision not resolved in .flattened-pom.xml"
 }
 
 # ---------------------------------------------------------------- Gradle
@@ -823,7 +859,7 @@ if [ "$SKIP_E2E" = 0 ]; then
       section "End-to-end scenarios"; skip "all network scenarios and corpus" "cannot reach repo1.maven.org (use --quick for offline-only checks)"
     else
       if [ "$TIER" != corpus ]; then
-        for s in basic single failing_test compile_error scopes ranges profiles reactor offline errors fallback gradle gradle_real sigterm concurrent graphs; do
+        for s in basic single failing_test compile_error scopes ranges profiles reactor offline errors fallback parity_plugins gradle gradle_real sigterm concurrent graphs; do
           want "$s" && "sc_$s"
         done
       fi
