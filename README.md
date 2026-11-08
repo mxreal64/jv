@@ -323,21 +323,22 @@ trusted network): the token and traffic are not protected over plain `http`, and
 
 ## Editor integration
 
-`jv lsp` runs a small server over stdin/stdout for editors and scripts. It reads one JSON request per line
-and writes one JSON response per line (`{"result": ...}` or `{"error": "..."}`):
+`jv lsp` runs a lightweight JSON-RPC 2.0 server over stdin/stdout for editors (Neovim, VS Code, Helix, Zed, Emacs) and scripts, supporting both Maven and Gradle projects. It reads one JSON request per line and writes one JSON response per line:
 
 ```console
-$ echo '{"method":"projectInfo","params":{}}' | jv lsp
-{"result":{"artifact":"hello","group":"demo","modules":[{"group":"demo","artifact":"hello","version":"1.0","dir":"/work/hello"}],"version":"1.0"}}
+$ echo '{"jsonrpc":"2.0","id":1,"method":"projectInfo"}' | jv lsp
+{"jsonrpc":"2.0","id":1,"result":{"buildSystem":"maven","group":"demo","artifact":"hello","version":"1.0","modules":[{"group":"demo","artifact":"hello","version":"1.0","dir":"/work/hello"}]}}
 ```
 
 | Method | Params | Result |
 |---|---|---|
-| `classpath` | `{"scope": "compile" \| "runtime" \| "test"}` (default `test`) | `{"classpath": [...]}` (`null` when the project has no dependencies) |
-| `sourceRoots` | none | `{"main": [...], "test": [...]}` |
-| `projectInfo` | none | `{"group", "artifact", "version", "modules": [...]}` |
+| `classpath` | `{"file": "/path/to/File.java", "scope": "compile" \| "runtime" \| "test", "module": "app"}` | `{"classpath": [...], "scope": "...", "module": "...", "release": "...", "outputDir": "..."}` |
+| `compilerOptions` | `{"file": "/path/to/File.java", "module": "app"}` | `{"release": "17", "source": "17", "target": "17", "encoding": "UTF-8", "compilerArgs": [...], "mainOutput": "...", "testOutput": "..."}` |
+| `sourceRoots` | `{"file": "...", "module": "..."}` | `{"main": [...], "test": [...], "resources": [...], "testResources": [...]}` |
+| `projectInfo` | none | `{"buildSystem": "maven" \| "gradle", "group": "...", "artifact": "...", "version": "...", "modules": [...]}` |
 
-Resolution is cached and refreshed automatically when a module's `pom.xml` changes.
+- **File-scoped queries**: passing a `file` path automatically detects the owning module and auto-detects whether it is a `test` or `compile` file, returning the exact classpath, release version, and compiler options needed for that file.
+- **Auto-invalidation**: Resolution is cached and refreshed automatically when build scripts (`pom.xml`, `jv.toml`, `build.gradle*`, `settings.gradle*`, `gradle.properties`) change.
 
 ## Repositories and security
 

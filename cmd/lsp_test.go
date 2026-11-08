@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mxreal64/jv/cmd"
+	"github.com/mxreal64/jv/gradle"
 )
 
 // minimalPOM is a self-contained POM with no external dependencies so the
@@ -308,5 +309,250 @@ func TestLSPUnknownMethod(t *testing.T) {
 	}
 	if resp["error"] == nil || resp["error"] == "" {
 		t.Error("expected a non-empty error for unknown method")
+	}
+}
+
+func TestLSPJSONRPC2Conformance(t *testing.T) {
+	dir := t.TempDir()
+	writePOM(t, dir)
+
+	outBytes := runLSP(t, dir, func(in *bytes.Buffer) {
+		req := `{"jsonrpc":"2.0","id":101,"method":"projectInfo"}` + "\n"
+		in.WriteString(req)
+	})
+
+	var resp struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      int             `json:"id"`
+		Result  json.RawMessage `json:"result"`
+		Error   string          `json:"error"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(outBytes), &resp); err != nil {
+		t.Fatalf("unmarshal JSON-RPC 2.0 response: %v\nOutput: %s", err, string(outBytes))
+	}
+	if resp.JSONRPC != "2.0" {
+		t.Errorf("expected jsonrpc 2.0, got %q", resp.JSONRPC)
+	}
+	if resp.ID != 101 {
+		t.Errorf("expected id 101, got %d", resp.ID)
+	}
+	if resp.Error != "" {
+		t.Errorf("unexpected error: %s", resp.Error)
+	}
+}
+
+func TestLSPFileScopedQueries(t *testing.T) {
+	dir := t.TempDir()
+	writePOM(t, dir)
+
+	mainFile := filepath.Join(dir, "src/main/java/demo/App.java")
+	testFile := filepath.Join(dir, "src/test/java/demo/AppTest.java")
+	_ = os.MkdirAll(filepath.Dir(mainFile), 0o755)
+	_ = os.MkdirAll(filepath.Dir(testFile), 0o755)
+	_ = os.WriteFile(mainFile, []byte("package demo; class App {}"), 0o644)
+	_ = os.WriteFile(testFile, []byte("package demo; class AppTest {}"), 0o644)
+
+	// 1. Query test file -> auto-detect test scope and test-classes output dir
+	outBytes1 := runLSP(t, dir, func(in *bytes.Buffer) {
+		sendRequest(t, in, "classpath", map[string]string{"file": testFile})
+	})
+	var resp1 struct {
+		Result struct {
+			Scope     string   `json:"scope"`
+			Module    string   `json:"module"`
+			OutputDir string   `json:"outputDir"`
+			Classpath []string `json:"classpath"`
+		} `json:"result"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(outBytes1), &resp1); err != nil {
+		t.Fatalf("decode resp1: %v", err)
+	}
+	if resp1.Error != "" {
+		t.Fatalf("resp1 error: %s", resp1.Error)
+	}
+	if resp1.Result.Scope != "test" {
+		t.Errorf("expected scope test, got %s", resp1.Result.Scope)
+	}
+	if !strings.HasSuffix(filepath.ToSlash(resp1.Result.OutputDir), "target/test-classes") {
+		t.Errorf("expected outputDir target/test-classes, got %s", resp1.Result.OutputDir)
+	}
+
+	// 2. Query main file -> auto-detect compile scope and classes output dir
+	outBytes2 := runLSP(t, dir, func(in *bytes.Buffer) {
+		sendRequest(t, in, "classpath", map[string]string{"file": mainFile})
+	})
+	var resp2 struct {
+		Result struct {
+			Scope     string `json:"scope"`
+			OutputDir string `json:"outputDir"`
+		} `json:"result"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(outBytes2), &resp2); err != nil {
+		t.Fatalf("decode resp2: %v", err)
+	}
+	if resp2.Result.Scope != "compile" {
+		t.Errorf("expected scope compile, got %s", resp2.Result.Scope)
+	}
+	if !strings.HasSuffix(filepath.ToSlash(resp2.Result.OutputDir), "target/classes") {
+		t.Errorf("expected outputDir target/classes, got %s", resp2.Result.OutputDir)
+	}
+
+	// 3. Query compilerOptions
+	outBytes3 := runLSP(t, dir, func(in *bytes.Buffer) {
+		sendRequest(t, in, "compilerOptions", map[string]string{"file": mainFile})
+	})
+	var resp3 struct {
+		Result struct {
+			Encoding   string `json:"encoding"`
+			MainOutput string `json:"mainOutput"`
+			TestOutput string `json:"testOutput"`
+		} `json:"result"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(outBytes3), &resp3); err != nil {
+		t.Fatalf("decode resp3: %v", err)
+	}
+	if resp3.Result.Encoding != "UTF-8" {
+		t.Errorf("expected encoding UTF-8, got %s", resp3.Result.Encoding)
+	}
+	if !strings.HasSuffix(filepath.ToSlash(resp3.Result.MainOutput), "target/classes") {
+		t.Errorf("expected mainOutput target/classes, got %s", resp3.Result.MainOutput)
+	}
+}
+
+func TestLSPGradleSupport(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "build.gradle"), []byte("plugins { id 'java' }\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "settings.gradle"), []byte("rootProject.name = 'gradle-lsp-app'\n"), 0o644)
+
+	mainJava := filepath.Join(dir, "src/main/java")
+	testJava := filepath.Join(dir, "src/test/java")
+	mainClasses := filepath.Join(dir, "build/classes/java/main")
+	testClasses := filepath.Join(dir, "build/classes/java/test")
+	depJar := filepath.Join(dir, "dep.jar")
+	junitJar := filepath.Join(dir, "junit.jar")
+	_ = os.WriteFile(depJar, []byte("jar"), 0o644)
+	_ = os.WriteFile(junitJar, []byte("jar"), 0o644)
+
+	model := &gradle.Model{
+		Root: dir,
+		Projects: []gradle.Project{
+			{
+				Path:        ":",
+				Dir:         dir,
+				Name:        "gradle-lsp-app",
+				Group:       "com.example",
+				Version:     "2.0",
+				Java:        true,
+				MainJava:    []string{mainJava},
+				TestJava:    []string{testJava},
+				MainClasses: []string{mainClasses},
+				TestClasses: []string{testClasses},
+				Compile:     []string{depJar},
+				Runtime:     []string{depJar},
+				TestCompile: []string{depJar, junitJar},
+				TestRuntime: []string{depJar, junitJar},
+				Release:     "21",
+				Encoding:    "UTF-8",
+			},
+		},
+	}
+
+	key, err := gradle.CacheKey(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gradle.SaveCache(dir, key, model); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Query projectInfo
+	outBytes1 := runLSP(t, dir, func(in *bytes.Buffer) {
+		sendRequest(t, in, "projectInfo", nil)
+	})
+	var resp1 struct {
+		Result struct {
+			BuildSystem string `json:"buildSystem"`
+			Artifact    string `json:"artifact"`
+			Version     string `json:"version"`
+		} `json:"result"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(outBytes1), &resp1); err != nil {
+		t.Fatalf("decode resp1: %v", err)
+	}
+	if resp1.Error != "" {
+		t.Fatalf("resp1 error: %s", resp1.Error)
+	}
+	if resp1.Result.BuildSystem != "gradle" {
+		t.Errorf("expected buildSystem gradle, got %s", resp1.Result.BuildSystem)
+	}
+	if resp1.Result.Artifact != "gradle-lsp-app" {
+		t.Errorf("expected artifact gradle-lsp-app, got %s", resp1.Result.Artifact)
+	}
+
+	// 2. Query sourceRoots
+	outBytes2 := runLSP(t, dir, func(in *bytes.Buffer) {
+		sendRequest(t, in, "sourceRoots", nil)
+	})
+	var resp2 struct {
+		Result struct {
+			Main []string `json:"main"`
+			Test []string `json:"test"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(outBytes2), &resp2); err != nil {
+		t.Fatalf("decode resp2: %v", err)
+	}
+	if len(resp2.Result.Main) != 1 || resp2.Result.Main[0] != mainJava {
+		t.Errorf("expected mainJava %v, got %v", mainJava, resp2.Result.Main)
+	}
+
+	// 3. Query compilerOptions
+	outBytes3 := runLSP(t, dir, func(in *bytes.Buffer) {
+		sendRequest(t, in, "compilerOptions", nil)
+	})
+	var resp3 struct {
+		Result struct {
+			Release    string `json:"release"`
+			MainOutput string `json:"mainOutput"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(outBytes3), &resp3); err != nil {
+		t.Fatalf("decode resp3: %v", err)
+	}
+	if resp3.Result.Release != "21" {
+		t.Errorf("expected release 21, got %s", resp3.Result.Release)
+	}
+	if resp3.Result.MainOutput != mainClasses {
+		t.Errorf("expected mainOutput %s, got %s", mainClasses, resp3.Result.MainOutput)
+	}
+
+	// 4. Query classpath with file
+	appFile := filepath.Join(mainJava, "demo/App.java")
+	outBytes4 := runLSP(t, dir, func(in *bytes.Buffer) {
+		sendRequest(t, in, "classpath", map[string]string{"file": appFile})
+	})
+	var resp4 struct {
+		Result struct {
+			Scope     string   `json:"scope"`
+			Module    string   `json:"module"`
+			Release   string   `json:"release"`
+			Classpath []string `json:"classpath"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(outBytes4), &resp4); err != nil {
+		t.Fatalf("decode resp4: %v", err)
+	}
+	if resp4.Result.Scope != "compile" {
+		t.Errorf("expected scope compile for main java file, got %s", resp4.Result.Scope)
+	}
+	if resp4.Result.Release != "21" {
+		t.Errorf("expected release 21, got %s", resp4.Result.Release)
+	}
+	if len(resp4.Result.Classpath) != 1 || resp4.Result.Classpath[0] != depJar {
+		t.Errorf("expected classpath %v, got %v", []string{depJar}, resp4.Result.Classpath)
 	}
 }
