@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -24,7 +25,11 @@ var (
 func getTestJVBin(t *testing.T) string {
 	t.Helper()
 	testJVBinOnce.Do(func() {
-		bin := filepath.Join(os.TempDir(), "jv-parity-test-bin")
+		binName := "jv-parity-test-bin"
+		if runtime.GOOS == "windows" {
+			binName += ".exe"
+		}
+		bin := filepath.Join(os.TempDir(), binName)
 		cmd := exec.Command("go", "build", "-trimpath", "-o", bin, ".")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -50,6 +55,9 @@ func requireTools(t *testing.T, tools ...string) {
 
 func runToolCmd(t *testing.T, dir string, env []string, name string, args ...string) (string, error) {
 	t.Helper()
+	if resolved, err := exec.LookPath(name); err == nil {
+		name = resolved
+	}
 	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
 	if len(env) > 0 {
