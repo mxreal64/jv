@@ -8,11 +8,18 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 )
 
 // FallbackToMaven runs real mvn and returns its exit code.
 func FallbackToMaven(args []string) int {
-	cmd := exec.Command("mvn", args...)
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmdArgs := append([]string{"/c", "mvn"}, args...)
+		cmd = exec.Command("cmd.exe", cmdArgs...)
+	} else {
+		cmd = exec.Command("mvn", args...)
+	}
 	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError

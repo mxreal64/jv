@@ -96,7 +96,10 @@ func runGradleNative(o *cliOpts, args []string, cwd, gradleCmd string) (code int
 	model, ok := gradle.LoadCache(root, key)
 	if !ok {
 		logf("asking Gradle for the project model (cached until a build script changes)...")
-		if model, err = gradle.Query(ctx, gradleCmd, root, extra, o.offline); err != nil {
+		qctx, qcancel := context.WithTimeout(ctx, 90*time.Second)
+		model, err = gradle.Query(qctx, gradleCmd, root, extra, o.offline)
+		qcancel()
+		if err != nil {
 			logf("%v; delegating to gradle", err)
 			return 0, false
 		}

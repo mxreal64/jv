@@ -75,7 +75,7 @@ public class App {
 	// Reference build with gradle to compare classes
 	refDir := t.TempDir()
 	writeGradleProject(t, refDir, buildGradle, "rootProject.name = 'singleapp'", mainJava)
-	_, err = runToolCmd(t, refDir, nil, "gradle", "-q", "classes")
+	_, err = runToolCmd(t, refDir, nil, "gradle", "--no-daemon", "-q", "classes")
 	if err != nil {
 		t.Fatalf("gradle classes failed: %v", err)
 	}

@@ -143,7 +143,13 @@ func FallbackToGradle(args []string) int {
 	}
 
 	gradleArgs := TranslateMavenArgs(args)
-	cmd := exec.Command(cmdPath, gradleArgs...)
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmdArgs := append([]string{"/c", cmdPath}, gradleArgs...)
+		cmd = exec.Command("cmd.exe", cmdArgs...)
+	} else {
+		cmd = exec.Command(cmdPath, gradleArgs...)
+	}
 	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError

@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 )
@@ -155,14 +156,23 @@ func Query(ctx context.Context, gradleCmd, root string, extra []string, offline 
 	if err := os.WriteFile(script, []byte(initScript), 0o644); err != nil {
 		return nil, err
 	}
-	args := []string{"-q", "--console=plain", "--no-configuration-cache", "--init-script", script, "-Djv.model.out=" + out}
+	args := []string{"--no-daemon", "-q", "--console=plain", "--no-configuration-cache", "--init-script", script, "-Djv.model.out=" + out}
 	if offline {
 		args = append(args, "--offline")
 	}
 	args = append(args, extra...)
 	args = append(args, "jvModel")
-	cmd := exec.CommandContext(ctx, gradleCmd, args...)
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmdArgs := append([]string{"/c", gradleCmd}, args...)
+		cmd = exec.CommandContext(ctx, "cmd.exe", cmdArgs...)
+	} else {
+		cmd = exec.CommandContext(ctx, gradleCmd, args...)
+	}
 	cmd.Dir = root
+	cmd.Stdin = strings.NewReader("")
+	cmd.Env = append(os.Environ(), "GRADLE_OPTS=-Dorg.gradle.daemon=false")
 	var stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = io.Discard, &stderr
 	if err := cmd.Run(); err != nil {

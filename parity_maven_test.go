@@ -5,6 +5,7 @@ package main
 
 import (
 	"archive/zip"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 var (
@@ -58,10 +60,23 @@ func runToolCmd(t *testing.T, dir string, env []string, name string, args ...str
 	if resolved, err := exec.LookPath(name); err == nil {
 		name = resolved
 	}
-	cmd := exec.Command(name, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	var cmd *exec.Cmd
+	isBatch := runtime.GOOS == "windows" && (strings.HasSuffix(strings.ToLower(name), ".bat") || strings.HasSuffix(strings.ToLower(name), ".cmd") || strings.EqualFold(filepath.Base(name), "gradle") || strings.EqualFold(filepath.Base(name), "gradlew") || strings.EqualFold(filepath.Base(name), "mvn"))
+	if isBatch {
+		cmdArgs := append([]string{"/c", name}, args...)
+		cmd = exec.CommandContext(ctx, "cmd.exe", cmdArgs...)
+	} else {
+		cmd = exec.CommandContext(ctx, name, args...)
+	}
 	cmd.Dir = dir
+	baseEnv := append(os.Environ(), "GRADLE_OPTS=-Dorg.gradle.daemon=false")
 	if len(env) > 0 {
-		cmd.Env = append(os.Environ(), env...)
+		cmd.Env = append(baseEnv, env...)
+	} else {
+		cmd.Env = baseEnv
 	}
 	out, err := cmd.CombinedOutput()
 	return string(out), err
