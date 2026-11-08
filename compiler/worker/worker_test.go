@@ -5,6 +5,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -132,6 +133,49 @@ func TestWorker_MultipleCompiles(t *testing.T) {
 		classFile := filepath.Join(outDir, "Class"+string(rune('A'+i))+".class")
 		if _, err := os.Stat(classFile); err != nil {
 			t.Fatalf("expected %s to exist: %v", classFile, err)
+		}
+	}
+}
+
+func TestWorker_ConcurrentCompiles(t *testing.T) {
+	if os.Getenv("JV_JAVAC_WORKER") == "0" {
+		t.Skip("worker daemon disabled via JV_JAVAC_WORKER=0")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	w, err := Start(ctx, "")
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer w.Stop()
+
+	if !w.IsActive() {
+		t.Skip("worker daemon not active (unix sockets may be unavailable in this environment)")
+	}
+
+	tmpDir := t.TempDir()
+	const n = 4
+	errCh := make(chan error, n)
+
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
+			srcFile := filepath.Join(tmpDir, fmt.Sprintf("Concurrent%d.java", i))
+			content := fmt.Sprintf("public class Concurrent%d {}\n", i)
+			if wErr := os.WriteFile(srcFile, []byte(content), 0o644); wErr != nil {
+				errCh <- wErr
+				return
+			}
+			outDir := filepath.Join(tmpDir, fmt.Sprintf("out%d", i))
+			_ = os.MkdirAll(outDir, 0o755)
+			errCh <- w.Compile(ctx, []string{"-d", outDir, srcFile}, tmpDir)
+		}()
+	}
+
+	for i := 0; i < n; i++ {
+		if err := <-errCh; err != nil {
+			t.Errorf("concurrent compile %d failed: %v", i, err)
 		}
 	}
 }

@@ -4,6 +4,7 @@
 package worker
 
 import (
+	"bufio"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -15,7 +16,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
-	"time"
 )
 
 //go:embed server.jar
@@ -24,13 +24,19 @@ var serverJar []byte
 //go:embed server/Server.java
 var serverJavaSource []byte
 
-// Worker manages a persistent javac worker process communicating over a Unix domain socket.
+// Worker manages a persistent javac worker process communicating over IPC
+// (Unix domain socket on Linux/macOS, TCP loopback on Windows).
 type Worker struct {
 	JavaHome   string
-	socketPath string
+	socketPath string // IPC address: unix socket path (Unix) or "host:port" (Windows)
 	cmd        *exec.Cmd
 	stdin      io.WriteCloser
-	mu         sync.Mutex
+	mu         sync.Mutex // guards Stop only
+}
+
+// IsActive reports whether the worker daemon is running and connectable.
+func (w *Worker) IsActive() bool {
+	return w.socketPath != ""
 }
 
 type compileRequest struct {
@@ -44,32 +50,24 @@ type compileResponse struct {
 	Stderr   string `json:"stderr"`
 }
 
-// Start launches a persistent javac worker if JV_JAVAC_WORKER=1,
-// otherwise returns a worker configured to fall back to direct javac execution.
+// Start launches a persistent javac worker daemon. If the daemon fails to start,
+// a worker configured for direct javac fallback is returned with no error.
+// Set JV_JAVAC_WORKER=0 to disable the daemon entirely and always use direct javac.
 func Start(ctx context.Context, javaHome string) (*Worker, error) {
 	w := &Worker{JavaHome: javaHome}
-	if os.Getenv("JV_JAVAC_WORKER") != "1" {
+	if os.Getenv("JV_JAVAC_WORKER") == "0" {
 		return w, nil
 	}
-
-	if err := w.startDaemon(ctx); err != nil {
-		// graceful fallback to direct javac if daemon fails to start
-		return w, nil
-	}
+	// Best-effort: ignore daemon start failure and fall back to direct javac.
+	_ = w.startDaemon(ctx)
 	return w, nil
 }
 
 func (w *Worker) javaExecutable() string {
-	if w.JavaHome != "" {
-		p := filepath.Join(w.JavaHome, "bin", "java")
-		if runtime.GOOS == "windows" {
-			p += ".exe"
+	for _, jh := range []string{w.JavaHome, os.Getenv("JAVA_HOME")} {
+		if jh == "" {
+			continue
 		}
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p
-		}
-	}
-	if jh := os.Getenv("JAVA_HOME"); jh != "" {
 		p := filepath.Join(jh, "bin", "java")
 		if runtime.GOOS == "windows" {
 			p += ".exe"
@@ -82,16 +80,10 @@ func (w *Worker) javaExecutable() string {
 }
 
 func (w *Worker) javacExecutable() string {
-	if w.JavaHome != "" {
-		p := filepath.Join(w.JavaHome, "bin", "javac")
-		if runtime.GOOS == "windows" {
-			p += ".exe"
+	for _, jh := range []string{w.JavaHome, os.Getenv("JAVA_HOME")} {
+		if jh == "" {
+			continue
 		}
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p
-		}
-	}
-	if jh := os.Getenv("JAVA_HOME"); jh != "" {
 		p := filepath.Join(jh, "bin", "javac")
 		if runtime.GOOS == "windows" {
 			p += ".exe"
@@ -115,29 +107,33 @@ func (w *Worker) startDaemon(ctx context.Context) error {
 			return err
 		}
 	} else {
-		// Fallback: compile Server.java on the fly
+		// Fallback: compile Server.java on the fly (development mode).
 		srcPath := filepath.Join(tmpDir, "Server.java")
 		if err := os.WriteFile(srcPath, serverJavaSource, 0o644); err != nil {
 			return err
 		}
-		javac := w.javacExecutable()
-		buildCmd := exec.CommandContext(ctx, javac, "-d", tmpDir, srcPath)
+		buildCmd := exec.CommandContext(ctx, w.javacExecutable(), "--release", "17", "-d", tmpDir, srcPath)
 		if err := buildCmd.Run(); err != nil {
 			return err
 		}
 		jarPath = tmpDir
 	}
 
-	sock := filepath.Join(tmpDir, fmt.Sprintf("javac-%d.sock", os.Getpid()))
-	_ = os.Remove(sock)
+	ipcAddr := workerSocketPath(tmpDir)
+	javaArgs := []string{"-cp", jarPath, "worker.server.Server"}
+	javaArgs = append(javaArgs, serverCmdArgs(ipcAddr)...)
 
-	cmd := exec.CommandContext(ctx, w.javaExecutable(), "-cp", jarPath, "worker.server.Server", sock)
+	cmd := exec.CommandContext(ctx, w.javaExecutable(), javaArgs...)
+
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
 	}
-
-	cmd.Stdout = io.Discard
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		stdin.Close()
+		return err
+	}
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
@@ -147,50 +143,55 @@ func (w *Worker) startDaemon(ctx context.Context) error {
 
 	w.cmd = cmd
 	w.stdin = stdin
-	w.socketPath = sock
 
-	// Wait for socket to become connectable (timeout 10s)
-	deadline := time.Now().Add(10 * time.Second)
-	connected := false
-	for time.Now().Before(deadline) {
-		conn, dialErr := net.Dial("unix", sock)
-		if dialErr == nil {
-			conn.Close()
-			connected = true
-			break
+	// Read the READY line from the server. On Unix: "READY". On Windows: "READY:host:port".
+	readyCh := make(chan string, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdoutPipe)
+		if scanner.Scan() {
+			readyCh <- scanner.Text()
+		} else {
+			close(readyCh)
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
+		// Discard any further server stdout.
+		_, _ = io.Copy(io.Discard, stdoutPipe)
+	}()
 
-	if !connected {
+	select {
+	case line, ok := <-readyCh:
+		if !ok {
+			w.Stop()
+			return fmt.Errorf("worker closed stdout without sending READY")
+		}
+		addr, err := parseReadyAddr(line, ipcAddr)
+		if err != nil {
+			w.Stop()
+			return err
+		}
+		w.socketPath = addr
+	case <-ctx.Done():
 		w.Stop()
-		return fmt.Errorf("timed out waiting for javac worker socket")
+		return ctx.Err()
 	}
 
 	return nil
 }
 
 // Compile compiles Java sources using the worker daemon or falls back to direct javac.
+// Multiple goroutines may call Compile concurrently; each opens its own connection.
 func (w *Worker) Compile(ctx context.Context, args []string, dir string) error {
 	if w.socketPath == "" {
 		return w.compileDirect(ctx, args, dir)
 	}
 
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	// Try compiling via Unix domain socket
-	conn, err := net.Dial("unix", w.socketPath)
+	conn, err := dialWorker(w.socketPath)
 	if err != nil {
-		// Daemon connection failed; fallback to direct
+		// Daemon connection failed; fall back to direct javac.
 		return w.compileDirect(ctx, args, dir)
 	}
 	defer conn.Close()
 
-	req := compileRequest{
-		Args: args,
-		Dir:  dir,
-	}
+	req := compileRequest{Args: args, Dir: dir}
 	data, err := json.Marshal(req)
 	if err != nil {
 		return err
@@ -201,13 +202,13 @@ func (w *Worker) Compile(ctx context.Context, args []string, dir string) error {
 		return w.compileDirect(ctx, args, dir)
 	}
 
+	// Signal end-of-write for Unix connections so the server knows the request is complete.
 	if uconn, ok := conn.(*net.UnixConn); ok {
 		_ = uconn.CloseWrite()
 	}
 
 	var resp compileResponse
-	decoder := json.NewDecoder(conn)
-	if err := decoder.Decode(&resp); err != nil {
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
 		return w.compileDirect(ctx, args, dir)
 	}
 
@@ -225,8 +226,7 @@ func (w *Worker) Compile(ctx context.Context, args []string, dir string) error {
 }
 
 func (w *Worker) compileDirect(ctx context.Context, args []string, dir string) error {
-	bin := w.javacExecutable()
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := exec.CommandContext(ctx, w.javacExecutable(), args...)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -234,6 +234,7 @@ func (w *Worker) compileDirect(ctx context.Context, args []string, dir string) e
 }
 
 // Stop shuts down the worker process and cleans up resources.
+// It is safe to call Stop once at process exit; it is not concurrency-safe with Compile.
 func (w *Worker) Stop() {
 	w.mu.Lock()
 	defer w.mu.Unlock()

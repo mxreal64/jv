@@ -181,15 +181,17 @@ func CompileDirs(ctx context.Context, srcDirs []string, outDir string, classpath
 	}
 	args = append(args, "@"+argFile)
 
-	if os.Getenv("JV_JAVAC_WORKER") == "1" {
-		var workerArgs []string
-		for _, a := range args {
-			if !strings.HasPrefix(a, "-J") {
-				workerArgs = append(workerArgs, a)
+	// Use the persistent javac worker daemon unless explicitly disabled (JV_JAVAC_WORKER=0).
+	// The daemon is auto-started on first compile; if it fails to start it falls back to
+	// direct javac transparently. Workers handle concurrent requests via a thread pool.
+	if os.Getenv("JV_JAVAC_WORKER") != "0" {
+		if w := getWorker(ctx); w != nil && w.IsActive() {
+			var workerArgs []string
+			for _, a := range args {
+				if !strings.HasPrefix(a, "-J") {
+					workerArgs = append(workerArgs, a)
+				}
 			}
-		}
-		w := getWorker(ctx)
-		if w != nil {
 			if err := w.Compile(ctx, workerArgs, ""); err != nil {
 				return false, err
 			}
