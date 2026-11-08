@@ -409,6 +409,11 @@ func (p *Project) uses(q *Project) bool {
 	return false
 }
 
+// Uses reports whether project p depends on project q (on classpath or outputs).
+func (p *Project) Uses(q *Project) bool {
+	return p.uses(q)
+}
+
 // Order returns the Java projects with dependencies first.
 func (m *Model) Order() ([]*Project, error) {
 	var java []*Project

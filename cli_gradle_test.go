@@ -4,12 +4,15 @@
 package main
 
 import (
+	"context"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mxreal64/jv/gradle"
 )
@@ -264,5 +267,49 @@ func TestRunGradleNativeClasspathOfOneProject(t *testing.T) {
 	args = []string{"-q", "classpath"} // two Java projects and no -pl: ambiguous
 	if code, handled := runGradleNative(parseArgs(args), args, dir, missing); !handled || code != 1 {
 		t.Errorf("runGradleNative(classpath) at the root = (%d, %v); want (1, true)", code, handled)
+	}
+}
+
+func TestRunGradleGraph_ParallelAndOrder(t *testing.T) {
+	// a and b are independent, c depends on a
+	a := &gradle.Project{Name: "a", Path: ":a", Java: true, Jar: "/jar/a.jar"}
+	b := &gradle.Project{Name: "b", Path: ":b", Java: true, Jar: "/jar/b.jar"}
+	c := &gradle.Project{Name: "c", Path: ":c", Java: true, Jar: "/jar/c.jar", Compile: []string{"/jar/a.jar"}}
+
+	var running int32
+	var maxConcurrent int32
+	var aDone int32
+
+	err := runGradleGraph(context.Background(), []*gradle.Project{a, b, c}, 3, func(ctx context.Context, p *gradle.Project) error {
+		cur := atomic.AddInt32(&running, 1)
+		defer atomic.AddInt32(&running, -1)
+
+		for {
+			max := atomic.LoadInt32(&maxConcurrent)
+			if cur <= max || atomic.CompareAndSwapInt32(&maxConcurrent, max, cur) {
+				break
+			}
+		}
+
+		if p.Name == "c" {
+			if atomic.LoadInt32(&aDone) == 0 {
+				t.Errorf("project c started before dependency a finished")
+			}
+		}
+
+		time.Sleep(50 * time.Millisecond)
+
+		if p.Name == "a" {
+			atomic.StoreInt32(&aDone, 1)
+		}
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("runGradleGraph failed: %v", err)
+	}
+
+	if atomic.LoadInt32(&maxConcurrent) < 2 {
+		t.Errorf("expected parallel execution (maxConcurrent >= 2), got %d", maxConcurrent)
 	}
 }

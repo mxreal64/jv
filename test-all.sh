@@ -813,19 +813,19 @@ corpus_item() {
       && ok "$CUR: jv compiles" || bad "$CUR: jv compile failed" "see $LOGDIR/corpus-$name-jv.log"
     return
   fi
-  rm -rf "$proj/target" "$proj/.jv" "$proj/target.mvn"
+  rm -rf "$proj/target" "$proj/.jv" "$WORK/target.mvn.$name"
   local t0 t1 t2 t3 t4
   t0=$(now); mvn -q -B -ntp -f "$proj/pom.xml" compile >"$LOGDIR/corpus-$name-mvn.log" 2>&1; local mrc=$?; t1=$(now)
   if [ $mrc -ne 0 ]; then skip "$CUR: compile parity" "mvn compile itself fails here (see $LOGDIR/corpus-$name-mvn.log)"; return; fi
   local mcount; mcount=$(find "$proj/target/classes" -name '*.class' | wc -l | tr -d ' ')
-  mv "$proj/target" "$proj/target.mvn"
+  mv "$proj/target" "$WORK/target.mvn.$name"
   t2=$(now); (cd "$proj" && "$JVBIN" -q compile) >"$LOGDIR/corpus-$name-jv.log" 2>&1; local jrc=$?; t3=$(now)
   if [ $jrc -ne 0 ]; then bad "$CUR: jv compile failed where mvn succeeded" "see $LOGDIR/corpus-$name-jv.log"; return; fi
   local jcount; jcount=$(find "$proj/target/classes" -name '*.class' | wc -l | tr -d ' ')
   [ "$mcount" = "$jcount" ] && ok "$CUR: compiled class count matches mvn ($jcount)" || bad "$CUR: class count differs" "mvn=$mcount jv=$jcount"
   (cd "$proj" && "$JVBIN" -q compile) >/dev/null 2>&1; t4=$(now)
   TIMES="$TIMES"$'\n'"$(printf '  %-22s cold: jv %6ss   mvn %6ss   | warm (no-op): jv %5ss' "$name" "$(elapsed "$t2" "$t3")" "$(elapsed "$t0" "$t1")" "$(elapsed "$t3" "$t4")")"
-  rm -rf "$proj/target.mvn"
+  rm -rf "$WORK/target.mvn.$name"
   if [ "$RUN_TESTS" = 1 ]; then
     (cd "$proj" && "$JVBIN" -q test) >"$LOGDIR/corpus-$name-jvtest.log" 2>&1; local jt=$?
     mvn -q -B -ntp -f "$proj/pom.xml" test >"$LOGDIR/corpus-$name-mvntest.log" 2>&1; local mt=$?

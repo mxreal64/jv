@@ -13,12 +13,14 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/mxreal64/jv/compiler"
 	"github.com/mxreal64/jv/config"
 	"github.com/mxreal64/jv/gradle"
+	"github.com/mxreal64/jv/lifecycle"
 	"github.com/mxreal64/jv/packager"
 	"github.com/mxreal64/jv/resolver"
 	"github.com/mxreal64/jv/runner"
@@ -199,15 +201,13 @@ func runGradleNative(o *cliOpts, args []string, cwd, gradleCmd string) (code int
 			}
 			fmt.Println(strings.Join(model.Subst(list), string(os.PathListSeparator)))
 		default:
-			for _, p := range targets {
-				if err := buildGradleProject(ctx, mk, model, p, goal, o, len(targets) > 1); err != nil {
-					if ctx.Err() != nil {
-						errf("interrupted")
-					} else {
-						errf("%s: %v", p.Name, err)
-					}
-					return 1, true
+			if err := buildGradleTargets(ctx, mk, model, targets, goal, o); err != nil {
+				if ctx.Err() != nil {
+					errf("interrupted")
+				} else {
+					errf("%v", err)
 				}
+				return 1, true
 			}
 		}
 	}
@@ -225,16 +225,148 @@ func nonEmpty(in ...string) []string {
 	return out
 }
 
-func buildGradleProject(ctx context.Context, mk func() *resolver.Loader, model *gradle.Model, p *gradle.Project, goal string, o *cliOpts, multi bool) error {
+func runGradleGraph(ctx context.Context, targets []*gradle.Project, workers int, fn func(context.Context, *gradle.Project) error) error {
+	if len(targets) == 0 {
+		return nil
+	}
+	dependents := make(map[*gradle.Project][]*gradle.Project, len(targets))
+	inDegree := make(map[*gradle.Project]int, len(targets))
+	for _, p := range targets {
+		for _, q := range targets {
+			if p.Uses(q) {
+				dependents[q] = append(dependents[q], p)
+				inDegree[p]++
+			}
+		}
+	}
+	rem := make(map[*gradle.Project]int, len(targets))
+	var queue []*gradle.Project
+	for _, p := range targets {
+		rem[p] = inDegree[p]
+		if rem[p] == 0 {
+			queue = append(queue, p)
+		}
+	}
+	visited := 0
+	for len(queue) > 0 {
+		p := queue[0]
+		queue = queue[1:]
+		visited++
+		for _, d := range dependents[p] {
+			rem[d]--
+			if rem[d] == 0 {
+				queue = append(queue, d)
+			}
+		}
+	}
+	if visited != len(targets) {
+		return errors.New("dependency cycle between projects")
+	}
+
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(targets) {
+		workers = len(targets)
+	}
+
+	parent := ctx
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	ready := make(chan *gradle.Project, len(targets))
+	var mu sync.Mutex
+	var firstErr error
+	completed := 0
+	for _, p := range targets {
+		if inDegree[p] == 0 {
+			ready <- p
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case p, ok := <-ready:
+					if !ok {
+						return
+					}
+					err := fn(ctx, p)
+					mu.Lock()
+					if err != nil {
+						if firstErr == nil {
+							firstErr = err
+							cancel()
+						}
+						mu.Unlock()
+						return
+					}
+					completed++
+					for _, dep := range dependents[p] {
+						inDegree[dep]--
+						if inDegree[dep] == 0 {
+							ready <- dep
+						}
+					}
+					if completed == len(targets) {
+						close(ready)
+					}
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return firstErr
+	}
+	return parent.Err()
+}
+
+func buildGradleTargets(ctx context.Context, mk func() *resolver.Loader, model *gradle.Model, targets []*gradle.Project, goal string, o *cliOpts) error {
+	multi := len(targets) > 1
+	if !multi {
+		return buildGradleProject(ctx, mk, model, targets[0], goal, o, false)
+	}
+
+	// 1. Compile all main sources and copy resources concurrently across independent DAG nodes
+	workers := lifecycle.DefaultWorkers()
+	err := runGradleGraph(ctx, targets, workers, func(c context.Context, p *gradle.Project) error {
+		if err := compileGradleProject(c, model, p, multi); err != nil {
+			return fmt.Errorf("%s: %w", p.Name, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if goal == "compile" {
+		return nil
+	}
+
+	// 2. Remaining phases (tests, packaging) run sequentially in dependency order
+	for _, p := range targets {
+		if err := testAndPackageGradleProject(ctx, mk, model, p, goal, o, multi); err != nil {
+			return fmt.Errorf("%s: %w", p.Name, err)
+		}
+	}
+	return nil
+}
+
+func compileGradleProject(ctx context.Context, model *gradle.Model, p *gradle.Project, multi bool) error {
 	mlog := func(format string, a ...any) {
 		if multi {
 			logf("["+p.Name+"] "+format, a...)
 		} else {
 			logf(format, a...)
 		}
-	}
-	if err := os.Chdir(p.Dir); err != nil {
-		return err
 	}
 	opts := compiler.Options{Encoding: p.Encoding, Release: p.Release, Source: p.Source, Target: p.Target, Args: p.CompilerArgs}
 	if opts.Encoding == "" {
@@ -261,9 +393,28 @@ func buildGradleProject(ctx context.Context, mk func() *resolver.Loader, model *
 			return fmt.Errorf("copying resources: %w", err)
 		}
 	}
-	if goal == "compile" {
-		return nil
+	return nil
+}
+
+func testAndPackageGradleProject(ctx context.Context, mk func() *resolver.Loader, model *gradle.Model, p *gradle.Project, goal string, o *cliOpts, multi bool) error {
+	mlog := func(format string, a ...any) {
+		if multi {
+			logf("["+p.Name+"] "+format, a...)
+		} else {
+			logf(format, a...)
+		}
 	}
+	if err := os.Chdir(p.Dir); err != nil {
+		return err
+	}
+	opts := compiler.Options{Encoding: p.Encoding, Release: p.Release, Source: p.Source, Target: p.Target, Args: p.CompilerArgs}
+	if opts.Encoding == "" {
+		opts.Encoding = "UTF-8"
+	}
+	if len(p.MainClasses) != 1 {
+		return fmt.Errorf("expected one main class directory, Gradle reported %d", len(p.MainClasses))
+	}
+	mainOut := p.MainClasses[0]
 
 	if !o.skipTestCompilation && len(p.TestJava) == 1 && len(p.TestClasses) == 1 {
 		testOut := p.TestClasses[0]
@@ -335,6 +486,16 @@ func buildGradleProject(ctx context.Context, mk func() *resolver.Loader, model *
 	}
 	mlog("built %s", p.Jar)
 	return nil
+}
+
+func buildGradleProject(ctx context.Context, mk func() *resolver.Loader, model *gradle.Model, p *gradle.Project, goal string, o *cliOpts, multi bool) error {
+	if err := compileGradleProject(ctx, model, p, multi); err != nil {
+		return err
+	}
+	if goal == "compile" {
+		return nil
+	}
+	return testAndPackageGradleProject(ctx, mk, model, p, goal, o, multi)
 }
 
 func hasLauncherPath(cp []string) bool {

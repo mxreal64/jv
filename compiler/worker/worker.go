@@ -172,12 +172,12 @@ func (w *Worker) startDaemon(ctx context.Context) error {
 
 // Compile compiles Java sources using the worker daemon or falls back to direct javac.
 func (w *Worker) Compile(ctx context.Context, args []string, dir string) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
 	if w.socketPath == "" {
 		return w.compileDirect(ctx, args, dir)
 	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
 	// Try compiling via Unix domain socket
 	conn, err := net.Dial("unix", w.socketPath)
