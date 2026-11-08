@@ -387,10 +387,39 @@ $ echo '{"jsonrpc":"2.0","id":1,"method":"projectInfo"}' | jv lsp
 - Classpath order follows Maven's tree order but is not guaranteed identical in every edge case (the set of
   jars is).
 
+## Watch mode
+
+`jv watch` keeps a build running continuously, polling source directories for changes and
+re-running the build goal on every edit:
+
+```console
+$ jv watch              # re-runs `test` on every change (default)
+$ jv watch compile      # re-compiles only on change
+$ jv watch test -pl app # watch a single module
+```
+
+**How it works:**
+
+1. **Mtime polling** — source directories (`src/main/java`, `src/test/java`, resources, and
+   any custom `<sourceDirectory>` from your POM) are scanned every 500 ms.
+2. **ABI-driven propagation** — only the module that owns a changed file and its downstream
+   dependents are rebuilt. If only a private method body changed (ABI fingerprint unchanged)
+   the downstream modules are skipped entirely.
+3. **Status bar** — the terminal is cleared on each rebuild and a compact pass/fail line is
+   printed with timestamps and elapsed time:
+   ```
+   ✔ [12:34:56] test — PASS (1.2s)
+   ✘ [12:35:10] test — FAIL (0.8s): app: compilation error
+   ```
+
+The worker daemon (auto-started, opt out with `JV_JAVAC_WORKER=0`) keeps the JVM warm between
+cycles so incremental compiles during watch are especially fast.
+
 ## Roadmap
 
 - Running experimental plugins natively by default, backed by comprehensive Maven and Gradle parity test suites.
 - Continued performance optimizations across incremental compilation and worker daemons.
+- `jv watch` OS-event backend (inotify/kqueue/ReadDirectoryChangesW) for sub-millisecond latency.
 
 ## Benchmarking
 

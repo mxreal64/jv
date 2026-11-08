@@ -95,6 +95,7 @@ var nativeGoals = map[string]bool{
 	"audit":     true,
 	"upgrade":   true,
 	"init":      true,
+	"watch":     true,
 }
 
 type cliOpts struct {
@@ -389,6 +390,20 @@ func run(args []string) int {
 		errf("%v", err)
 		return 1
 	}
+
+	// jv watch [goal] — continuous rebuild on source changes.
+	if len(build) > 0 && build[0] == "watch" {
+		watchGoal := "test"
+		if len(build) > 1 {
+			watchGoal = build[1]
+		}
+		wo := watchOpts{
+			goal:    watchGoal,
+			cliOpts: o,
+		}
+		return runWatch(ctx, wo, loader, ordered)
+	}
+
 	for _, goal := range build {
 		if goal == "clean" { // a clean that is not the first goal (or any clean with -pl) runs here, at its position
 			sel := ordered
