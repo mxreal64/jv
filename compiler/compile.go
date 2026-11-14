@@ -237,13 +237,24 @@ var (
 	defaultWorkerMu   sync.Mutex
 	defaultWorkerOnce sync.Once
 	defaultWorker     *worker.Worker
+	verboseWorker     bool // FIX #2: set by SetVerbose to surface daemon status
 )
+
+// SetVerbose enables verbose logging from the compiler package, including worker daemon status.
+func SetVerbose(v bool) { verboseWorker = v }
 
 func getWorker(ctx context.Context) *worker.Worker {
 	defaultWorkerOnce.Do(func() {
 		w, err := worker.Start(ctx, os.Getenv("JAVA_HOME"))
 		if err == nil {
 			defaultWorker = w
+		}
+		if verboseWorker {
+			if defaultWorker != nil && defaultWorker.IsActive() {
+				fmt.Fprintln(os.Stderr, "[jv] javac worker daemon started (JV_JAVAC_WORKER=0 to disable)")
+			} else {
+				fmt.Fprintln(os.Stderr, "[jv] javac worker daemon unavailable — using direct javac invocations")
+			}
 		}
 	})
 	return defaultWorker

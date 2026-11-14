@@ -118,3 +118,14 @@ func TestCompile_WorkerIntegration(t *testing.T) {
 		t.Fatalf("expected second Compile to be skipped due to stamp match")
 	}
 }
+
+func TestSetVerbose(t *testing.T) {
+	SetVerbose(true)
+	if !verboseWorker {
+		t.Fatal("expected verboseWorker to be true")
+	}
+	SetVerbose(false)
+	if verboseWorker {
+		t.Fatal("expected verboseWorker to be false")
+	}
+}

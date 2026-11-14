@@ -6,6 +6,7 @@
 package worker
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -17,8 +18,9 @@ func workerSocketPath(tmpDir string) string {
 }
 
 // dialWorker connects to the worker daemon over a Unix domain socket.
-func dialWorker(addr string) (net.Conn, error) {
-	return net.Dial("unix", addr)
+func dialWorker(ctx context.Context, addr string) (net.Conn, error) {
+	var d net.Dialer
+	return d.DialContext(ctx, "unix", addr)
 }
 
 // serverCmdArgs returns the command-line arguments to append to the Java server invocation.

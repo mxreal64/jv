@@ -16,15 +16,20 @@ import (
 	"github.com/mxreal64/jv/resolver"
 )
 
+const watchDebounce = 150 * time.Millisecond // FIX #3: de-bounce window
+
 // watchOpts holds the options parsed for `jv watch`.
 type watchOpts struct {
-	goal     string        // lifecycle goal to repeat (default: "test")
-	cliOpts  *cliOpts      // forwarded CLI flags (-pl, -offline, etc.)
-	interval time.Duration // poll interval (default: 500ms)
+	goal      string              // lifecycle goal to repeat (default: "test")
+	cliOpts   *cliOpts            // forwarded CLI flags (-pl, -offline, etc.)
+	interval  time.Duration       // poll interval (default: 500ms)
+	compileCP map[string][]string // FIX #1: module.Classes → compile classpath paths
 }
 
 // runWatch is the entry-point for `jv watch [goal]`.
 // It polls source directories for mtime changes and re-runs the build goal on each change.
+// compileCP maps each module's Classes directory to the list of classpath dirs/jars it
+// compiles against — used for precise ABI-driven downstream propagation (fix #1).
 func runWatch(ctx context.Context, wo watchOpts, loader *resolver.Loader, ordered []*resolver.Module) int {
 	if wo.interval <= 0 {
 		wo.interval = 500 * time.Millisecond
@@ -44,6 +49,9 @@ func runWatch(ctx context.Context, wo watchOpts, loader *resolver.Loader, ordere
 	ticker := time.NewTicker(wo.interval)
 	defer ticker.Stop()
 
+	// FIX #3: de-bounce — track the time of first detected change.
+	var firstChange time.Time
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -52,13 +60,32 @@ func runWatch(ctx context.Context, wo watchOpts, loader *resolver.Loader, ordere
 		case <-ticker.C:
 			changed, newMtimes := detectChanges(ordered, mtimes)
 			if len(changed) == 0 {
+				// No new changes — but check if we were debouncing and the window expired.
+				if !firstChange.IsZero() && time.Since(firstChange) >= watchDebounce {
+					firstChange = time.Time{} // already fired — reset (shouldn't reach here, but safe)
+				}
 				continue
 			}
+
+			// Accumulate changes into the snapshot immediately so the next poll
+			// doesn't re-report the same files.
 			mtimes = newMtimes
 
-			// Determine which modules are dirty (changed sources) and which are
-			// downstream of a dirty module whose ABI changed.
-			dirty := dirtyModules(ordered, changed, abiSnap)
+			if firstChange.IsZero() {
+				// First change detected: start the debounce window.
+				firstChange = time.Now()
+				continue
+			}
+
+			if time.Since(firstChange) < watchDebounce {
+				// Still within the debounce window — keep accumulating.
+				continue
+			}
+
+			// Debounce window elapsed: fire.
+			firstChange = time.Time{}
+
+			dirty := dirtyModules(ordered, changed, abiSnap, wo.compileCP)
 			if len(dirty) == 0 {
 				continue
 			}
@@ -112,18 +139,21 @@ func runWatchCycle(ctx context.Context, wo watchOpts, loader *resolver.Loader, t
 }
 
 // dirtyModules returns the subset of ordered modules that must be rebuilt.
-// A module is dirty if any of its source files changed, OR if it transitively
-// depends on a dirty module whose ABI (public API fingerprint) changed.
-func dirtyModules(ordered []*resolver.Module, changedFiles map[string]struct{}, abiSnap map[string]string) []*resolver.Module {
-	// Set of output directories whose ABI changed after last build.
+//
+// A module is "directly dirty" if any of its own source files changed.
+// A module is "downstream dirty" if its compile classpath contains the Classes
+// directory of a directly-dirty module (FIX #1: uses real classpath, not path heuristics).
+// If compileCP is nil or empty, falls back to the conservative path-heuristic so
+// Gradle watch (which doesn't have per-module classpath data) still works.
+func dirtyModules(ordered []*resolver.Module, changedFiles map[string]struct{}, abiSnap map[string]string, compileCP map[string][]string) []*resolver.Module {
+	// Set of output directories whose ABI is potentially changed (pre-rebuild).
 	abiChanged := map[string]bool{}
 
-	// First pass: modules with directly-changed sources.
+	// First pass: modules with directly-changed source files.
 	directlyDirty := map[*resolver.Module]bool{}
 	for _, m := range ordered {
 		if moduleOwnsFile(m, changedFiles) {
 			directlyDirty[m] = true
-			// Mark the module's output dirs as "potentially ABI-changed" until rebuilt.
 			abiChanged[m.Classes] = true
 			abiChanged[m.TestClasses] = true
 		}
@@ -132,18 +162,14 @@ func dirtyModules(ordered []*resolver.Module, changedFiles map[string]struct{}, 
 		return nil
 	}
 
-	// Second pass: propagate downstream using ABI fingerprints.
-	// A downstream module only needs rebuilding if its upstream's ABI actually changed.
-	// Since we haven't rebuilt yet, we conservatively include any module that
-	// compiles against a dirty module's output directory.
+	// Second pass: propagate downstream.
 	dirty := map[*resolver.Module]bool{}
 	for _, m := range ordered {
 		if directlyDirty[m] {
 			dirty[m] = true
 			continue
 		}
-		// Check whether any classpath entry of this module is in the ABI-changed set.
-		if moduleDependsOn(m, abiChanged) {
+		if moduleDependsOn(m, abiChanged, compileCP) {
 			dirty[m] = true
 		}
 	}
@@ -170,27 +196,28 @@ func moduleOwnsFile(m *resolver.Module, changedFiles map[string]struct{}) bool {
 	return false
 }
 
-// moduleDependsOn reports whether m has any output directory from abiChanged on its classpath.
-// We approximate by checking whether the module's Dir is a prefix of any abiChanged key,
-// or by looking at the sibling module structure (Classes/TestClasses of other modules).
-func moduleDependsOn(m *resolver.Module, abiChanged map[string]bool) bool {
-	// The compile classpath of m will contain Classes dirs of modules it depends on.
-	// Since we don't have the full resolved classpath here, we approximate: if any
-	// module whose output is in abiChanged shares a common parent with m, we include m.
-	// A more precise check would require traversing resolver.Artifact lists.
-	// For now: check if Classes/TestClasses of m is NOT in abiChanged (then we may need
-	// to rebuild it if its upstream changed). We do this by checking the module's
-	// target/classes path relative to other dirty module dirs.
-	//
-	// Practical heuristic that works for the common reactor layout:
-	// if any entry in abiChanged is in a sibling module under the same parent, include m.
+// moduleDependsOn reports whether m has any entry in abiChanged on its actual compile classpath.
+//
+// FIX #1: when compileCP is provided (Maven watch), we check the real resolved classpath.
+// Fallback: path-prefix heuristic for Gradle watch where classpath data isn't available.
+func moduleDependsOn(m *resolver.Module, abiChanged map[string]bool, compileCP map[string][]string) bool {
+	if len(compileCP) > 0 {
+		// Precise check: look up this module's actual compile classpath entries.
+		cp := compileCP[m.Classes]
+		for _, entry := range cp {
+			if abiChanged[entry] {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Fallback heuristic (Gradle / no classpath data): any sibling module in the
+	// same reactor parent whose output changed means we conservatively rebuild.
 	for dir := range abiChanged {
 		if dir == "" {
 			continue
 		}
-		// dir is e.g. /project/core/target/classes
-		// m.Classes is e.g. /project/app/target/classes
-		// They share /project as a common grandparent — both are siblings.
 		if filepath.Dir(filepath.Dir(filepath.Dir(dir))) ==
 			filepath.Dir(filepath.Dir(filepath.Dir(m.Classes))) {
 			return true
@@ -267,7 +294,7 @@ func detectChanges(modules []*resolver.Module, prev map[string]time.Time) (map[s
 		}
 	}
 
-	// Also detect deletions.
+	// Detect deletions.
 	for path := range prev {
 		if _, ok := current[path]; !ok {
 			changed[path] = struct{}{}

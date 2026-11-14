@@ -27,7 +27,7 @@ import (
 )
 
 // Goals the Gradle model oracle can serve natively. Everything else goes to Gradle itself.
-var gradleGoals = map[string]bool{"clean": true, "compile": true, "test": true, "package": true, "classpath": true}
+var gradleGoals = map[string]bool{"clean": true, "compile": true, "test": true, "package": true, "classpath": true, "watch": true}
 
 // findGradleRoot returns the directory holding settings.gradle[.kts] (searching upwards),
 // or dir itself for a single-project build.
@@ -163,6 +163,46 @@ func runGradleNative(o *cliOpts, args []string, cwd, gradleCmd string) (code int
 			loader.Offline, loader.Verbose, loader.Quiet = o.offline, o.verbose, o.quiet
 		}
 		return loader
+	}
+
+	// FIX #4: jv watch on a Gradle project — build synthetic resolver.Module stubs from
+	// the Gradle model's project list and hand them to the shared watch loop.
+	if len(o.goals) > 0 && o.goals[0] == "watch" {
+		watchGoal := "test"
+		if len(o.goals) > 1 {
+			watchGoal = o.goals[1]
+		}
+		// Convert Gradle projects to resolver.Module stubs so runWatch can poll src roots.
+		synth := make([]*resolver.Module, 0, len(targets))
+		for _, p := range targets {
+			if !p.Java {
+				continue
+			}
+			mc := ""
+			if len(p.MainClasses) > 0 {
+				mc = p.MainClasses[0]
+			}
+			tc := ""
+			if len(p.TestClasses) > 0 {
+				tc = p.TestClasses[0]
+			}
+			synth = append(synth, &resolver.Module{
+				Dir:         p.Dir,
+				Classes:     mc,
+				TestClasses: tc,
+			})
+		}
+		if len(synth) == 0 {
+			logf("no Java projects to watch; delegating to gradle")
+			return 0, false
+		}
+		// Use heuristic propagation (compileCP=nil) for Gradle since we don't have
+		// per-module classpath data at this point without resolving each project.
+		wo := watchOpts{
+			goal:    watchGoal,
+			cliOpts: o,
+		}
+		return runWatch(ctx, wo, mk(), synth), true
 	}
 
 	for _, goal := range o.goals {

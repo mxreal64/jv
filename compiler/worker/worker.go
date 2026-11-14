@@ -31,11 +31,13 @@ type Worker struct {
 	socketPath string // IPC address: unix socket path (Unix) or "host:port" (Windows)
 	cmd        *exec.Cmd
 	stdin      io.WriteCloser
-	mu         sync.Mutex // guards Stop only
+	mu         sync.RWMutex // guards socketPath and Stop
 }
 
 // IsActive reports whether the worker daemon is running and connectable.
 func (w *Worker) IsActive() bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
 	return w.socketPath != ""
 }
 
@@ -168,7 +170,9 @@ func (w *Worker) startDaemon(ctx context.Context) error {
 			w.Stop()
 			return err
 		}
+		w.mu.Lock()
 		w.socketPath = addr
+		w.mu.Unlock()
 	case <-ctx.Done():
 		w.Stop()
 		return ctx.Err()
@@ -180,13 +184,19 @@ func (w *Worker) startDaemon(ctx context.Context) error {
 // Compile compiles Java sources using the worker daemon or falls back to direct javac.
 // Multiple goroutines may call Compile concurrently; each opens its own connection.
 func (w *Worker) Compile(ctx context.Context, args []string, dir string) error {
-	if w.socketPath == "" {
+	w.mu.RLock()
+	addr := w.socketPath
+	w.mu.RUnlock()
+	if addr == "" {
 		return w.compileDirect(ctx, args, dir)
 	}
 
-	conn, err := dialWorker(w.socketPath)
+	conn, err := dialWorker(ctx, addr)
 	if err != nil {
-		// Daemon connection failed; fall back to direct javac.
+		// Daemon connection failed; mark inactive and fall back to direct javac.
+		w.mu.Lock()
+		w.socketPath = ""
+		w.mu.Unlock()
 		return w.compileDirect(ctx, args, dir)
 	}
 	defer conn.Close()

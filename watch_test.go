@@ -145,7 +145,7 @@ func TestDirtyModules_DirectChange(t *testing.T) {
 	changedFile := filepath.Join(m1.Dir, "src", "main", "java", "Core.java")
 	changed := map[string]struct{}{changedFile: {}}
 
-	dirty := dirtyModules(ordered, changed, abiSnap)
+	dirty := dirtyModules(ordered, changed, abiSnap, nil)
 	if len(dirty) == 0 {
 		t.Fatal("expected at least m1 to be dirty")
 	}
@@ -160,6 +160,49 @@ func TestDirtyModules_DirectChange(t *testing.T) {
 	}
 }
 
+func TestDirtyModules_ClasspathPropagation(t *testing.T) {
+	root := t.TempDir()
+	m1 := makeModule(t, filepath.Join(root, "core"))
+	m2 := makeModule(t, filepath.Join(root, "app"))
+	m3 := makeModule(t, filepath.Join(root, "other"))
+	ordered := []*resolver.Module{m1, m2, m3}
+	abiSnap := map[string]string{}
+
+	// m2 compiles against m1.Classes; m3 does not
+	compileCP := map[string][]string{
+		m2.Classes: {m1.Classes, "/some/external.jar"},
+		m3.Classes: {"/some/external.jar"},
+	}
+
+	// Change file in m1
+	changedFile := filepath.Join(m1.Dir, "src", "main", "java", "Core.java")
+	changed := map[string]struct{}{changedFile: {}}
+
+	dirty := dirtyModules(ordered, changed, abiSnap, compileCP)
+	// Both m1 (directly dirty) and m2 (dependent on m1) should be dirty, but NOT m3
+	m1Found, m2Found, m3Found := false, false, false
+	for _, m := range dirty {
+		if m == m1 {
+			m1Found = true
+		}
+		if m == m2 {
+			m2Found = true
+		}
+		if m == m3 {
+			m3Found = true
+		}
+	}
+	if !m1Found {
+		t.Error("expected m1 to be dirty")
+	}
+	if !m2Found {
+		t.Error("expected m2 to be dirty via classpath dependency on m1")
+	}
+	if m3Found {
+		t.Error("expected m3 NOT to be dirty (not depending on m1)")
+	}
+}
+
 func TestModuleSrcRoots_DefaultLayout(t *testing.T) {
 	dir := t.TempDir()
 	m := &resolver.Module{Dir: dir}
@@ -171,5 +214,22 @@ func TestModuleSrcRoots_DefaultLayout(t *testing.T) {
 		if !filepath.IsAbs(r) {
 			t.Errorf("expected absolute src root path, got %q", r)
 		}
+	}
+}
+
+func TestDirtyModules_FallbackHeuristic(t *testing.T) {
+	root := t.TempDir()
+	m1 := makeModule(t, filepath.Join(root, "core"))
+	m2 := makeModule(t, filepath.Join(root, "app"))
+	ordered := []*resolver.Module{m1, m2}
+	abiSnap := map[string]string{}
+
+	changedFile := filepath.Join(m1.Dir, "src", "main", "java", "Core.java")
+	changed := map[string]struct{}{changedFile: {}}
+
+	// nil compileCP triggers the fallback heuristic (e.g. for Gradle watch)
+	dirty := dirtyModules(ordered, changed, abiSnap, nil)
+	if len(dirty) != 2 {
+		t.Fatalf("expected both siblings in dirty set under fallback heuristic, got %d", len(dirty))
 	}
 }

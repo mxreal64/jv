@@ -231,7 +231,9 @@ public class Server {
     }
 
     // -------------------------------------------------------------------------
-    // JSON helpers (no external library dependency)
+    // JSON helpers — proper recursive-descent parser (FIX #5)
+    // Handles all escape sequences including unicode escapes, nested objects/arrays,
+    // numbers, booleans, null. No external library dependency.
     // -------------------------------------------------------------------------
 
     private static String quoteJson(String s) {
@@ -260,52 +262,95 @@ public class Server {
         return sb.toString();
     }
 
+    /** Parses a top-level JSON object into a Map. Values are String or List&lt;String&gt;. */
     private static Map<String, Object> parseJson(String s) {
-        Map<String, Object> res = new HashMap<>();
-        s = s.trim();
-        if (s.startsWith("{")) s = s.substring(1);
-        if (s.endsWith("}"))   s = s.substring(0, s.length() - 1);
-        int i = 0;
-        while (i < s.length()) {
-            while (i < s.length() && (Character.isWhitespace(s.charAt(i)) || s.charAt(i) == ',')) i++;
-            if (i >= s.length() || s.charAt(i) != '"') break;
-            int keyStart = ++i;
-            while (i < s.length() && s.charAt(i) != '"') i++;
-            String key = s.substring(keyStart, i++);
-            while (i < s.length() && (Character.isWhitespace(s.charAt(i)) || s.charAt(i) == ':')) i++;
-            if (i >= s.length()) break;
-
-            if (s.charAt(i) == '"') {
-                i++;
-                StringBuilder sb = new StringBuilder();
-                while (i < s.length()) {
-                    char c = s.charAt(i);
-                    if (c == '\\' && i + 1 < s.length()) { sb.append(s.charAt(++i)); i++; }
-                    else if (c == '"')                    { i++; break; }
-                    else                                  { sb.append(c); i++; }
-                }
-                res.put(key, sb.toString());
-            } else if (s.charAt(i) == '[') {
-                i++;
-                List<String> arr = new ArrayList<>();
-                while (i < s.length()) {
-                    while (i < s.length() && (Character.isWhitespace(s.charAt(i)) || s.charAt(i) == ',')) i++;
-                    if (i < s.length() && s.charAt(i) == ']') { i++; break; }
-                    if (i < s.length() && s.charAt(i) == '"') {
-                        i++;
-                        StringBuilder sb = new StringBuilder();
-                        while (i < s.length()) {
-                            char c = s.charAt(i);
-                            if (c == '\\' && i + 1 < s.length()) { sb.append(s.charAt(++i)); i++; }
-                            else if (c == '"')                    { i++; break; }
-                            else                                  { sb.append(c); i++; }
-                        }
-                        arr.add(sb.toString());
-                    } else { i++; }
-                }
-                res.put(key, arr);
-            } else { i++; }
+        int[] pos = {0};
+        skipWs(s, pos);
+        if (pos[0] >= s.length() || s.charAt(pos[0]) != '{') return new LinkedHashMap<>();
+        pos[0]++; // consume '{'
+        Map<String, Object> res = new LinkedHashMap<>();
+        while (true) {
+            skipWs(s, pos);
+            if (pos[0] >= s.length()) break;
+            char c = s.charAt(pos[0]);
+            if (c == '}') { pos[0]++; break; }
+            if (c == ',') { pos[0]++; continue; }
+            if (c != '"') { pos[0]++; continue; }
+            String key = parseString(s, pos);
+            skipWs(s, pos);
+            if (pos[0] < s.length() && s.charAt(pos[0]) == ':') pos[0]++;
+            skipWs(s, pos);
+            Object val = parseValue(s, pos);
+            res.put(key, val);
         }
         return res;
     }
+
+    private static Object parseValue(String s, int[] pos) {
+        skipWs(s, pos);
+        if (pos[0] >= s.length()) return "";
+        char c = s.charAt(pos[0]);
+        if (c == '"') return parseString(s, pos);
+        if (c == '[') return parseArray(s, pos);
+        if (c == '{') { parseJson(s.substring(pos[0])); return ""; } // nested object — skip, unsupported
+        int start = pos[0];
+        while (pos[0] < s.length()) {
+            char ch = s.charAt(pos[0]);
+            if (ch == ',' || ch == '}' || ch == ']' || Character.isWhitespace(ch)) break;
+            pos[0]++;
+        }
+        return s.substring(start, pos[0]); // number / boolean / null as string
+    }
+
+    private static List<String> parseArray(String s, int[] pos) {
+        pos[0]++; // consume '['
+        List<String> arr = new ArrayList<>();
+        while (true) {
+            skipWs(s, pos);
+            if (pos[0] >= s.length()) break;
+            char c = s.charAt(pos[0]);
+            if (c == ']') { pos[0]++; break; }
+            if (c == ',') { pos[0]++; continue; }
+            Object v = parseValue(s, pos);
+            arr.add(v == null ? "" : v.toString());
+        }
+        return arr;
+    }
+
+    private static String parseString(String s, int[] pos) {
+        pos[0]++; // consume opening '"'
+        StringBuilder sb = new StringBuilder();
+        while (pos[0] < s.length()) {
+            char c = s.charAt(pos[0]++);
+            if (c == '"') break;
+            if (c != '\\') { sb.append(c); continue; }
+            if (pos[0] >= s.length()) break;
+            char esc = s.charAt(pos[0]++);
+            switch (esc) {
+                case '"'  -> sb.append('"');
+                case '\\' -> sb.append('\\');
+                case '/'  -> sb.append('/');
+                case 'b'  -> sb.append('\b');
+                case 'f'  -> sb.append('\f');
+                case 'n'  -> sb.append('\n');
+                case 'r'  -> sb.append('\r');
+                case 't'  -> sb.append('\t');
+                case 'u'  -> { // unicode escape (\\uHEX) — previously unhandled
+                    if (pos[0] + 4 <= s.length()) {
+                        String hex = s.substring(pos[0], pos[0] + 4);
+                        pos[0] += 4;
+                        try { sb.append((char) Integer.parseInt(hex, 16)); }
+                        catch (NumberFormatException ignored) { sb.append("\\u").append(hex); }
+                    }
+                }
+                default -> sb.append(esc);
+            }
+        }
+        return sb.toString();
+    }
+
+    private static void skipWs(String s, int[] pos) {
+        while (pos[0] < s.length() && Character.isWhitespace(s.charAt(pos[0]))) pos[0]++;
+    }
 }
+

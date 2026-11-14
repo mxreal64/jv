@@ -297,6 +297,7 @@ func run(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	defer compiler.ShutdownWorker()
+	compiler.SetVerbose(o.verbose) // FIX #2: surface daemon start/fail in -v mode
 	start := time.Now()
 
 	settings, err := config.LoadSettings(o.settingsFile)
@@ -397,9 +398,22 @@ func run(args []string) int {
 		if len(build) > 1 {
 			watchGoal = build[1]
 		}
+		// FIX #1: build real per-module compile-classpath map so dirty propagation
+		// uses actual dependency edges, not path-prefix heuristics.
+		compileCP := make(map[string][]string, len(ordered))
+		for _, m := range ordered {
+			if m.Classes == "" {
+				continue
+			}
+			arts, _, err := resolveModule(loader, m, false, func(string, ...any) {})
+			if err == nil {
+				compileCP[m.Classes] = resolver.Classpath(arts, "compile")
+			}
+		}
 		wo := watchOpts{
-			goal:    watchGoal,
-			cliOpts: o,
+			goal:      watchGoal,
+			cliOpts:   o,
+			compileCP: compileCP,
 		}
 		return runWatch(ctx, wo, loader, ordered)
 	}

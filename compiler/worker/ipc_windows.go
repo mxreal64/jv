@@ -6,6 +6,7 @@
 package worker
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
@@ -18,16 +19,18 @@ func workerSocketPath(_ string) string {
 }
 
 // dialWorker connects to the worker daemon via TCP loopback.
-func dialWorker(addr string) (net.Conn, error) {
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
-		if err == nil {
-			return conn, nil
+// Bounded by ctx and a maximum 500ms timeout so failures fail over to direct javac immediately.
+func dialWorker(ctx context.Context, addr string) (net.Conn, error) {
+	var d net.Dialer
+	timeout := 500 * time.Millisecond
+	if deadline, ok := ctx.Deadline(); ok {
+		if rem := time.Until(deadline); rem < timeout {
+			timeout = rem
 		}
-		time.Sleep(20 * time.Millisecond)
 	}
-	return nil, fmt.Errorf("timed out connecting to worker at %s", addr)
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return d.DialContext(dialCtx, "tcp", addr)
 }
 
 // serverCmdArgs returns "--tcp" to tell the Java server to use TCP loopback mode.
