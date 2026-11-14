@@ -36,7 +36,7 @@ import (
 )
 
 var (
-	version = "v0.3.0-rc1"
+	version = "v0.3.0-rc2"
 	quiet   bool
 )
 
