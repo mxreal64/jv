@@ -430,15 +430,15 @@ cycles so incremental compiles during watch are especially fast.
 ./bench.sh --project path/to/your/project --no-gradle
 ```
 
-### Measured Performance (Linux x86_64, OpenJDK 27, Median of 5 Runs)
+### Measured Performance (Linux x86_64, OpenJDK 27, Median of 7 Runs)
 
 | Scenario | `jv` | `mvn` 3.10 | `mvnd` 1.0.2 | `gradle` 9.9 | Notes |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **Warm: Nothing Changed** | **10 ms** | 3,357 ms | 138 ms | 7,194 ms | Pure startup + stamp check (**~335x faster than Maven**) |
-| **Cold Resolve + Compile** | **2,360 ms** | 10,648 ms | 4,975 ms | 9,486 ms | Empty repo, full network download + javac (**~4.5x faster**) |
-| **Warm: One File Changed** | **1,061 ms** | 3,535 ms | 145 ms | 6,360 ms | Incremental compile on modified source (**~3.3x faster**) |
-| **Warm: Lock Miss** | **856 ms** | — | — | — | Classes wiped, local repo cached → re-resolve & compile |
-| **Full Build** | **3,841 ms** | 7,028 ms | 863 ms | 6,167 ms | Full lifecycle: compile + test + package (**~1.8x faster**) |
+| **Warm: Nothing Changed** | **11 ms** | 5,553 ms | 196 ms | 6,190 ms | Pure startup + stamp check (**~504x faster than Maven**) |
+| **Cold Resolve + Compile** | **2,708 ms** | 9,419 ms | 2,758 ms | 9,647 ms | Empty repo, full network download + javac (**~3.5x faster**) |
+| **Warm: One File Changed** | **904 ms** | 6,012 ms | 302 ms | 6,007 ms | Incremental compile on modified source (**~6.6x faster**) |
+| **Warm: Lock Miss** | **1,278 ms** | — | — | — | Classes wiped, local repo cached → re-resolve & compile |
+| **Full Build** | **3,813 ms** | 7,765 ms | 1,522 ms | 6,338 ms | Full lifecycle: compile + test + package (**~2.0x faster**) |
 
 *Note: For Gradle, `--no-daemon` is used to measure cold tool startup; warm Gradle daemon performance is comparable to `mvnd`.*
 
